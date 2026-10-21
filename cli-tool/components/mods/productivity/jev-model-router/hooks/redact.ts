@@ -52,6 +52,23 @@ export const DEFAULT_REDACT: RedactOptions = {
 /** Placeholders counted per detector type. */
 export type RedactCounts = Record<string, number>
 
+/**
+ * Is `host:rest@` really `host:port/path?query=a@b` and not user:password@?
+ * Fail-closed: only the unambiguous shape is left alone. That is a hostname
+ * that looks like one (localhost, an IPv4, or a dotted name), a valid port
+ * (1-65535, digits only), a '/' straight after it, and a '?' or '#' later,
+ * so the '@' sits in a query or fragment. Everything else (`admin:1234?x@h`,
+ * `u:123#frag@h`, `u:1234/x@h`, a bare `admin:12345@h`) is a password.
+ */
+function isHostPortUrl(host: string, rest: string): boolean {
+  const m = /^(\d{1,5})\/(.*)$/s.exec(rest)
+  if (!m) return false
+  const port = Number(m[1])
+  if (port < 1 || port > 65535) return false
+  if (!/[?#]/.test(m[2] ?? '')) return false
+  return /^localhost$/i.test(host) || /^\d{1,3}(?:\.\d{1,3}){3}$/.test(host) || /^[a-z0-9-]+(?:\.[a-z0-9-]+)+$/i.test(host)
+}
+
 export function placeholder(type: string): string {
   return `[REDACTED:${type}]`
 }
@@ -310,9 +327,7 @@ export function redact(text: string, options: RedactOptions): { text: string; co
   out = sub(out, GOOGLE_KEY, 'google-api-key', counts)
   out = sub(out, JWT, 'jwt', counts)
   out = sub(out, URL_CREDENTIALS, 'url-credentials', counts, (_m, g) =>
-    // `host:3000/path?x=a@b`: a port and a path, not a user and a password.
-    // A password that is only digits (`user:12345@host`) has no path after it.
-    /^\d{1,5}[/?#]/.test(g[2] ?? '') ? null : `${g[0]}${placeholder('url-credentials')}@`,
+    isHostPortUrl(g[1] ?? '', g[2] ?? '') ? null : `${g[0]}${placeholder('url-credentials')}@`,
   )
   out = sub(out, URL_TOKEN_USER, 'url-credentials', counts, (m, g) =>
     /\d/.test(g[1] ?? '') ? `${g[0]}${placeholder('url-credentials')}@` : null,

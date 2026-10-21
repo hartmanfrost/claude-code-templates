@@ -442,7 +442,8 @@ test('custom patterns: alternation inside a repeated group is refused as a backt
 
 test('url credentials: host:port with a path and a later @ is not a user and password', () => {
   expect(out('open http://localhost:3000/a?x=1&email=me@x.com now')).toBe('open http://localhost:3000/a?x=1&email=me@x.com now')
-  expect(out('curl http://host:8080?u=a@b.c')).toBe('curl http://host:8080?u=a@b.c')
+  expect(out('curl http://my.host.io:8080/p#u=a@b.c')).toBe('curl http://my.host.io:8080/p#u=a@b.c')
+  expect(out('curl http://127.0.0.1:8080/?u=a@b.c')).toBe('curl http://127.0.0.1:8080/?u=a@b.c')
   // A numeric password has no path after it and is still redacted.
   expect(out('postgres://admin:12345@db/app')).toBe('postgres://[REDACTED:url-credentials]@db/app')
 })
@@ -452,4 +453,16 @@ test('riskyPattern: forced alternations and short bounded repeats are allowed, a
   for (const bad of ['(a|aa)+', '(a+)+', '(a*)*', '(.*a){20}', '(\\w+\\s?)+$', '(?:a{1,5})+', '(a|b)+(c|d)+(?:(x|y)z)+', '(a|ab)*', '(a|aa){2,100}', '(a|a)+', '(|a)+']) {
     expect(riskyPattern(bad)).toBe(true)
   }
+})
+
+test('url credentials: a digit-led password is redacted unless it is unambiguously host:port/path?query', () => {
+  expect(out('http://admin:1234?x@host/')).toBe('http://[REDACTED:url-credentials]@host/')
+  expect(out('http://u:123#frag@h')).toBe('http://[REDACTED:url-credentials]@h')
+  expect(out('http://u:1234/x@h')).toBe('http://[REDACTED:url-credentials]@h')
+  expect(out('http://u:99999/a?b=c@h')).toBe('http://[REDACTED:url-credentials]@h')
+  expect(out('http://u:0/a?b=c@h')).toBe('http://[REDACTED:url-credentials]@h')
+  // A bare name (not localhost, an IP or a dotted host) is a user.
+  expect(out('http://admin:1234/a?x=1@h')).toBe('http://[REDACTED:url-credentials]@h')
+  expect(out('http://admin:12345@db/app')).toBe('http://[REDACTED:url-credentials]@db/app')
+  expect(out('http://localhost:3000/a?x=1&email=me@x.com')).toBe('http://localhost:3000/a?x=1&email=me@x.com')
 })

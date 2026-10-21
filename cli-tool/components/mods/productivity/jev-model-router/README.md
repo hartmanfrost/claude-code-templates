@@ -119,6 +119,11 @@ Linear time: built-in detectors use literal prefixes and bounded, non-overlappin
 - **Toasts** only exist in an interactive terminal; `claude -p` and the SDK get the transcript line and the debug log.
 - **Main-loop routing**, if switched on, is fail-open: on any failure the turn runs unchanged (it has no fallback to apply), and the failure is shown the same way.
 
+## What changed in 0.5.0-hartmanfrost.3
+
+- **Secret redaction is fail-closed for `scheme://user:NNNN...@`.** Only `localhost`, an IPv4 or a dotted host with a valid port, a `/`, and a later `?`/`#` is read as `host:port/path?query`; `http://admin:1234?x@host/` and `http://u:123#frag@h` are redacted.
+- **No stale effort entries.** A spawn that settles without an agent id (or is denied or throws) removes its own entry at once, and unclaimed entries expire after 60 s, so a later spawn with the same prompt cannot claim a stale effort.
+
 ## What changed after 0.5.0-hartmanfrost.2
 
 - **Effort cannot cross to another spawn.** Every spawn that reaches `agent.spawn`'s `next` (routed or skipped) files an entry under its prompt, a skipped one as "no effort", so an unrouted agent whose prompt equals a routed spawn's takes its own entry at `turn.start`.

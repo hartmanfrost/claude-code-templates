@@ -825,11 +825,14 @@ export function describeFailure(
  * prompt first (`turn.start` of the agent carries that prompt and its id),
  * and under the id too once `next` returns, whichever comes first.
  */
-export function createEffortPlans(max = 256): {
-  expect(promptKey: string, effort: Effort | null): void
-  cancel(promptKey: string, effort: Effort | null): void
-  bind(agentId: string, promptKey: string, effort: Effort | null): void
-  claim(agentId: string, promptKey: string): void
+export function createEffortPlans(
+  max = 256,
+  ttlMs = 60_000,
+): {
+  expect(promptKey: string, effort: Effort | null, now?: number): number
+  cancel(promptKey: string, effort: Effort | null, ticket?: number): void
+  bind(agentId: string, promptKey: string, effort: Effort | null, ticket?: number, now?: number): void
+  claim(agentId: string, promptKey: string, now?: number): void
   effortOf(agentId: string): Effort | undefined
   release(agentId: string): void
   size(): number
@@ -837,8 +840,23 @@ export function createEffortPlans(max = 256): {
   // `null` is a spawn that was NOT given an effort (skipped, unrouted). It is
   // queued like any other so that such an agent, whose turn.start carries the
   // same prompt as a routed spawn, takes its own entry and not the routed one.
+  // Every entry has a ticket (its spawn removes exactly its own) and a time
+  // (an entry nobody claimed within `ttlMs` is dropped, so a spawn that never
+  // got an agent id cannot hand its effort to a later identical prompt).
+  type Entry = { effort: Effort | null; ticket: number; at: number }
   const byAgent = new Map<string, Effort | null>()
-  const waiting = new Map<string, (Effort | null)[]>()
+  const waiting = new Map<string, Entry[]>()
+  let nextTicket = 1
+  let latest = 0
+  const sweep = (now?: number) => {
+    if (now !== undefined && now > latest) latest = now
+    if (latest === 0) return
+    for (const [key, queue] of waiting) {
+      const fresh = queue.filter((entry) => latest - entry.at <= ttlMs)
+      if (fresh.length === 0) waiting.delete(key)
+      else if (fresh.length !== queue.length) waiting.set(key, fresh)
+    }
+  }
   const trim = () => {
     while (byAgent.size > max) {
       const oldest = byAgent.keys().next().value
@@ -851,34 +869,48 @@ export function createEffortPlans(max = 256): {
       waiting.delete(oldest)
     }
   }
-  const take = (promptKey: string, effort?: Effort | null): { found: boolean; effort: Effort | null } => {
+  const take = (
+    promptKey: string,
+    effort?: Effort | null,
+    ticket?: number,
+  ): { found: boolean; effort: Effort | null } => {
     const queue = waiting.get(promptKey)
     if (!queue || queue.length === 0) return { found: false, effort: null }
-    const index = effort === undefined ? 0 : queue.indexOf(effort)
+    let index: number
+    if (ticket !== undefined) index = queue.findIndex((entry) => entry.ticket === ticket)
+    else if (effort === undefined) index = 0
+    else index = queue.findIndex((entry) => entry.effort === effort)
     if (index === -1) return { found: false, effort: null }
     const [taken] = queue.splice(index, 1)
     if (queue.length === 0) waiting.delete(promptKey)
-    return { found: true, effort: taken ?? null }
+    return { found: true, effort: taken?.effort ?? null }
   }
   return {
-    expect(promptKey, effort) {
+    expect(promptKey, effort, now) {
+      sweep(now)
       const queue = waiting.get(promptKey) ?? []
-      queue.push(effort)
+      const ticket = nextTicket++
+      queue.push({ effort, ticket, at: latest })
       waiting.set(promptKey, queue)
       trim()
+      return ticket
     },
-    cancel(promptKey, effort) {
-      take(promptKey, effort)
+    cancel(promptKey, effort, ticket) {
+      // With a ticket, only that spawn's own entry goes; without one, the
+      // first entry of this effort.
+      take(promptKey, effort, ticket)
     },
-    bind(agentId, promptKey, effort) {
+    bind(agentId, promptKey, effort, ticket, now) {
+      sweep(now)
       // An agent that already claimed its entry at turn.start must not take a
       // second one: that belongs to another spawn with the same prompt.
       if (byAgent.has(agentId)) return
-      take(promptKey, effort)
+      take(promptKey, effort, ticket)
       byAgent.set(agentId, effort)
       trim()
     },
-    claim(agentId, promptKey) {
+    claim(agentId, promptKey, now) {
+      sweep(now)
       if (byAgent.has(agentId)) return
       const taken = take(promptKey)
       if (taken.found) byAgent.set(agentId, taken.effort)
@@ -888,7 +920,7 @@ export function createEffortPlans(max = 256): {
     release(agentId) {
       byAgent.delete(agentId)
     },
-    size: () => byAgent.size + waiting.size,
+    size: () => byAgent.size + [...waiting.values()].reduce((n, q) => n + q.length, 0),
   }
 }
 

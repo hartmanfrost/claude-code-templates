@@ -310,19 +310,21 @@ export const register: Register = (on, options) => {
     // no agent can take another spawn's.
     const launch = async (ev: typeof e, effort: Effort | null) => {
       const promptKey = hashKey(ev.prompt)
-      plans.expect(promptKey, effort)
+      const ticket = plans.expect(promptKey, effort, await $.clock.now())
       let result
       try {
         result = await next(ev)
       } catch (error) {
-        plans.cancel(promptKey, effort)
+        plans.cancel(promptKey, effort, ticket)
         throw error
       }
-      if (result.deny !== undefined) {
-        plans.cancel(promptKey, effort)
+      // No agent id means no agent will be bound to this entry: drop it now,
+      // or a later spawn with the same prompt would claim it.
+      if (result.deny !== undefined || !result.agentId) {
+        plans.cancel(promptKey, effort, ticket)
         return result
       }
-      if (result.agentId) plans.bind(result.agentId, promptKey, effort)
+      plans.bind(result.agentId, promptKey, effort, ticket, await $.clock.now())
       return result
     }
 

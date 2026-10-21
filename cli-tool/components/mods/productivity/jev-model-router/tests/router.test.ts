@@ -669,3 +669,43 @@ test('binding removes the matching entry even when the agent id arrives late', (
   expect(plans.effortOf('b')).toBe('low')
   expect(plans.size()).toBe(2)
 })
+
+// --- effort plans: spawns that never get an agent id ----------------------------------------
+
+test('a spawn that settles without an agent id removes its own entry', () => {
+  const plans = createEffortPlans()
+  const key = hashKey('same prompt')
+  const stale = plans.expect(key, 'xhigh', 1000)
+  // next() settled with no agentId: the launcher cancels its own ticket.
+  plans.cancel(key, 'xhigh', stale)
+  expect(plans.size()).toBe(0)
+  // A later spawn with the same prompt does not inherit it.
+  const own = plans.expect(key, null, 2000)
+  plans.claim('later', key, 2000)
+  expect(plans.effortOf('later')).toBeUndefined()
+  expect(plans.size()).toBe(1)
+  void own
+})
+
+test('cancelling by ticket never removes another spawn\'s entry of the same effort', () => {
+  const plans = createEffortPlans()
+  const key = hashKey('p')
+  const first = plans.expect(key, 'low', 1)
+  const second = plans.expect(key, 'low', 2)
+  plans.claim('a', key, 3) // a took the first entry at turn.start
+  plans.cancel(key, 'low', first) // first spawn settles with no id: its entry is gone already
+  plans.claim('b', key, 4)
+  expect(plans.effortOf('b')).toBe('low')
+  void second
+})
+
+test('an unclaimed entry expires after the ttl, a fresh one does not', () => {
+  const plans = createEffortPlans(256, 60_000)
+  const key = hashKey('p')
+  plans.expect(key, 'xhigh', 0 + 1)
+  plans.expect(hashKey('other'), 'low', 30_000)
+  plans.claim('late', key, 61_002)
+  expect(plans.effortOf('late')).toBeUndefined()
+  plans.claim('x', hashKey('other'), 61_002)
+  expect(plans.effortOf('x')).toBe('low')
+})
