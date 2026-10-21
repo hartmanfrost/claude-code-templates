@@ -1,337 +1,395 @@
 /**
  * jev-model-router — Claude Mod
  *
- * Picks the model each task runs on with TypeSafe's Jev, a System One
- * decision model: unstructured state in, a typed choice with a probability
- * distribution out.
+ * Picks the model AND the reasoning effort of each SUBAGENT with TypeSafe's
+ * Jev, a System One decision model: unstructured state in, a typed choice with
+ * a probability distribution out.
  *
- * Jev is reached one of two ways, whichever key is configured: TypeSafe's
- * own API (`typesafeApiKey`), which reports a calibrated confidence per
- * answer, or the Vercel AI Gateway (`gatewayApiKey`), which does not. With
- * neither, the engine's own `$.model.classify` stands in, so the mod is
- * useful without any account.
+ * What it routes:
+ *   agent.spawn  — the model of every subagent the Agent tool or a Workflow
+ *                  `agent()` starts (haiku, sonnet or opus; the caller's own
+ *                  `model` is overridden, Jev decides)
+ *   turn.step    — that subagent's effort (low..xhigh, never max), looked up
+ *                  by the agent's id, which `agent.spawn` hands back
+ *   turn.complete— drops the agent's entry
+ * The main conversation is NOT routed unless `routeMainEffort` or
+ * `routeMainModel` is switched on; with both off `prompt.submit` makes no
+ * call at all, so no prompt of yours leaves the machine.
  *
- * Three things it can set, each on its own switch:
- *   agent.spawn  — the model of each subagent (on by default)
- *   turn.step    — the reasoning effort of the main loop (on by default)
- *   turn.step    — the model of the main loop (off by default: switching
- *                  models mid-session invalidates the prompt cache, which can
- *                  cost more than the cheaper tier saves)
+ * Failure is loud, not silent. When Jev cannot decide (timeout, HTTP error,
+ * unreadable answer, no key), the subagent runs on `fallbackModel` /
+ * `fallbackEffort`, both applied explicitly, and the person is told with a
+ * toast and a transcript line (once per kind of failure, and again at 5, 25,
+ * 100 ... occurrences).
  *
- * Every one of them moves in both directions: a task the decision model reads
- * as mechanical is routed down, one it reads as hard is routed up. The two
- * mistakes do not cost the same, so they do not clear the same confidence bar
- * (see `minUpgradeConfidence` / `minDowngradeConfidence` in policy.ts).
+ * What leaves the machine: only the subagent's prompt (cut to
+ * `maxPromptChars`), description and agent type, after a best-effort
+ * secret-redaction pass (see redact.ts). Never the API key beyond its
+ * Authorization header, and never in any log.
  *
- * The Agent tool has no effort parameter, so a subagent's effort is not ours
- * to set; only its model is.
- *
- * The prompt is classified at `prompt.submit`, which runs before the turn
- * starts, and the decision is applied at the turn's first request.
- *
- * Every failure path is fail-open: a classification that errors or runs past
- * the latency budget leaves the request exactly as the engine built it.
- *
- * The API key comes from the plugin's options (userConfig "typesafeApiKey"
- * or "gatewayApiKey"). Never hardcode it in this file.
- *
- * Needs Claude Code >= 2.1.287. Typed
- * against Anthropic's declarations: https://github.com/anthropics/claude-code/tree/main/mods
- *
- * Privacy: with a key set, the prompt text is sent to whichever backend the
- * key belongs to.
+ * Needs Claude Code >= 2.1.287. Typed against Anthropic's declarations.
  */
-import type { Register } from 'claude-code'
+import type { EngineInterface, Register } from 'claude-code'
 import {
-  DEFAULT_BASE_URL,
-  DEFAULT_MODEL,
+  TIER_ORDER,
+  bareCommand,
+  buildPromptState,
+  buildSubagentState,
+  classifyStatus,
+  createBreaker,
+  createDecisionCache,
+  createEffortPlans,
+  createNotifier,
+  createPendingPrompts,
+  createPlaceholderGuard,
   describeDecision,
+  describeFailure,
   describeSetup,
   describeStatus,
-  endpoint,
-  pendingDecisions,
+  fallbackRouting,
+  fromPerson,
+  hashKey,
+  isTier,
+  rankOf,
   readDecision,
-  selectProvider,
   requestBody,
   requestHeaders,
   requestModelId,
+  resolveOptions,
   route,
-  TIER_ORDER,
-  bareCommand,
+  routeSubagent,
+  skipReason,
 } from './policy.ts'
-import type { Decision, Effort, PolicyConfig, Provider, Tier } from './policy.ts'
+import type { Decision, Effort, RouterConfig } from './policy.ts'
+import { describeCounts, scrubForLog } from './redact.ts'
+import type { RedactCounts } from './redact.ts'
+
+type Dollar = EngineInterface
+
+/** What a call to the decision model came to. */
+interface Outcome {
+  decision: Decision | null
+  /** The failure kind (see describeFailure), or null on success. */
+  failure: string | null
+  fatal: boolean
+}
+
+/** One loud line: a toast on a surface that has one, and always a transcript row. */
+function loud($: Dollar, text: string): void {
+  try {
+    $.ui.toast(text)
+  } catch {
+    // A surface with no toast still gets the transcript line below.
+  }
+  $.ui.log(text)
+}
+
+/**
+ * Posts the state to the decision model, bounded by the latency budget. A
+ * request that outlives the budget is not cancelled (the API has no abort);
+ * the breaker is what stops the next ones.
+ */
+async function askJev(
+  $: Dollar,
+  config: RouterConfig,
+  state: Record<string, string>,
+): Promise<Outcome> {
+  const provider = config.provider
+  if (!provider) return { decision: null, failure: 'no-key', fatal: false }
+  try {
+    const response = await Promise.race([
+      $.http.fetch(config.url, {
+        method: 'POST',
+        headers: requestHeaders(provider, config.apiKey, config.modelId),
+        body: requestBody(provider, state, config.modelId),
+      }),
+      $.clock.sleep(config.timeoutMs),
+    ])
+    if (!response) return { decision: null, failure: 'timeout', fatal: false }
+    if (!response.ok) {
+      const { kind, fatal } = classifyStatus(response.status)
+      return { decision: null, failure: kind, fatal }
+    }
+    const decision = readDecision(response.text)
+    return decision
+      ? { decision, failure: null, fatal: false }
+      : { decision: null, failure: 'malformed', fatal: false }
+  } catch (error) {
+    $.ui.log(`[jev-model-router] request failed: ${scrubForLog(String(error))}`, { to: 'debug' })
+    return { decision: null, failure: 'network', fatal: false }
+  }
+}
+
+/** The engine's own small-model classifier, used only when `provider` is "builtin". */
+async function askBuiltin($: Dollar, text: string): Promise<Outcome> {
+  try {
+    const label = await $.model.classify(text, TIER_ORDER)
+    if (isTier(label)) {
+      const decision: Decision = {
+        tier: label,
+        confidence: null,
+        risky: null,
+        effort: null,
+        effortConfidence: null,
+      }
+      return { decision, failure: null, fatal: false }
+    }
+  } catch (error) {
+    $.ui.log(`[jev-model-router] built-in classifier failed: ${scrubForLog(String(error))}`, { to: 'debug' })
+  }
+  return { decision: null, failure: 'classifier', fatal: false }
+}
+
+/** Everything the helpers that take `$` need besides `$` itself. */
+interface Ctx {
+  config: RouterConfig
+  warnings: string[]
+  notifier: ReturnType<typeof createNotifier>
+  flags: { announced: boolean; fallbacks: number }
+}
+
+/** The one-time "I am alive" line, and the one-time list of option problems. */
+function announce($: Dollar, ctx: Ctx): void {
+  if (ctx.flags.announced) return
+  ctx.flags.announced = true
+  if (ctx.config.logDecisions) $.ui.log(`[jev-model-router] ${describeSetup(ctx.config)}`)
+  if (ctx.warnings.length > 0) {
+    ctx.notifier.report('config')
+    loud($, `[jev-model-router] ignoring invalid options: ${ctx.warnings.join('; ')}`)
+  }
+}
+
+/** Counts a failure and shows it when it is the first of its kind, or an escalation. */
+function reportFailure($: Dollar, ctx: Ctx, kind: string, scope: 'subagent' | 'main'): void {
+  const { count, show } = ctx.notifier.report(`${scope}:${kind}`)
+  if (scope === 'subagent') ctx.flags.fallbacks += 1
+  if (show) loud($, describeFailure(kind, count, ctx.config, scope))
+  if (scope === 'subagent') $.ui.status(`jev · fallback ×${ctx.flags.fallbacks} (${kind})`)
+}
 
 export const register: Register = (on, options) => {
-  const text = (key: string, fallback: string) =>
-    typeof options[key] === 'string' && options[key] ? (options[key] as string) : fallback
-  const number = (key: string, fallback: number) =>
-    typeof options[key] === 'number' ? (options[key] as number) : fallback
-  const flag = (key: string, fallback: boolean) =>
-    typeof options[key] === 'boolean' ? (options[key] as boolean) : fallback
+  const { config, warnings } = resolveOptions(options)
+  const policy = config.policy
 
-  // TypeSafe's own API is preferred when both keys are set: it is the only
-  // one that reports a calibrated confidence, which the policy's threshold
-  // reads. `provider` forces one, including "builtin" to use neither.
-  const typesafeKey = text('typesafeApiKey', '')
-  const gatewayKey = text('gatewayApiKey', '')
-  const forced = text('provider', 'auto')
-  const active: Provider | null = selectProvider(forced, typesafeKey, gatewayKey)
+  const breaker = createBreaker()
+  const cache = createDecisionCache()
+  const notifier = createNotifier()
+  const plans = createEffortPlans()
+  const guard = createPlaceholderGuard()
+  const pending = createPendingPrompts()
+  // Main-loop bookkeeping, per turn, dropped at turn.complete.
+  const claimed = new Map<string, Decision | null>()
+  const mainPlans = new Map<string, { model?: string; effort?: Effort } | null>()
 
-  // Each backend keeps its own URL and model, so an override written for one
-  // can never be sent to the other when `auto` picks differently than expected.
-  const apiKey = active === 'typesafe' ? typesafeKey : active === 'gateway' ? gatewayKey : ''
-  const modelId = !active
-    ? ''
-    : active === 'typesafe'
-      ? text('typesafeModel', DEFAULT_MODEL.typesafe)
-      : text('gatewayModel', DEFAULT_MODEL.gateway)
-  const url = !active
-    ? ''
-    : active === 'typesafe'
-      ? endpoint('typesafe', text('typesafeBaseUrl', DEFAULT_BASE_URL.typesafe))
-      : endpoint('gateway', text('gatewayBaseUrl', DEFAULT_BASE_URL.gateway))
+  const flags = { announced: false, fallbacks: 0 }
 
-  // A backend named in the options but missing its key degrades to the
-  // built-in classifier, which is silent; say so once, when a hook first runs.
-  let unusableReported = forced === 'auto' || forced === 'builtin' || active !== null
+  const ctx: Ctx = { config, warnings, notifier, flags }
 
-  const timeoutMs = number('timeoutMs', 800)
-  const routeSubagentModel = flag('routeSubagentModel', true)
-  const routeMainEffort = flag('routeMainEffort', true)
-  const routeMainModel = flag('routeMainModel', false)
-  const routeMainLoop = routeMainEffort || routeMainModel
-  const logDecisions = flag('logDecisions', true)
+  on('turn.start', async ($, e, next) => {
+    if (e.agentId) {
+      // The subagent's own turn: its text is the prompt it was spawned with,
+      // and its id is what turn.step will carry.
+      plans.claim(e.agentId, hashKey(e.text))
+    } else if (config.routeMainLoop) {
+      claimed.set(e.turnId, pending.claim(e.text))
+    }
+    return next(e)
+  })
 
-  const policy: PolicyConfig = {
-    tiers: {
-      fast: text('fastModel', 'haiku'),
-      balanced: text('balancedModel', 'sonnet'),
-      deep: text('deepModel', 'opus'),
-    },
-    minUpgradeConfidence: number('minUpgradeConfidence', 0.3),
-    minDowngradeConfidence: number('minDowngradeConfidence', 0.6),
-  }
-
-  // The classification waiting for the turn that reads its prompt, and what
-  // the current turn settled on. Both are single slots: main-loop turns run
-  // one at a time, so nothing accumulates over a long session. `pending`
-  // reports no decision when two prompts are waiting at once, rather than
-  // routing a turn on a decision made for a different prompt.
-  const pending = pendingDecisions()
-  // Said once, the first time a hook runs. A router that loaded and one that
-  // never loaded are otherwise told apart only by the absence of later lines,
-  // and absence is not evidence: the policy leaves most turns alone anyway.
-  let announced = false
-  let appliedTurnId: string | undefined
-  let applied: { model?: string; effort?: Effort } | null = null
+  on('turn.complete', async ($, e, next) => {
+    if (e.agentId) {
+      plans.release(e.agentId)
+    } else {
+      claimed.delete(e.turnId)
+      mainPlans.delete(e.turnId)
+    }
+    return next(e)
+  })
 
   on('prompt.submit', async ($, e, next) => {
-    // Before the routing guards: a module whose switches are all off has still
-    // loaded, and that is exactly when its silence is most misleading.
-    if (!announced) {
-      announced = true
-      if (logDecisions) {
-        $.ui.log(
-          `[jev-model-router] ${describeSetup(
-            active,
-            url,
-            {
-              subagentModel: routeSubagentModel,
-              mainEffort: routeMainEffort,
-              mainModel: routeMainModel,
-            },
-            forced === 'builtin',
-          )}`,
-        )
-      }
-    }
-    if (!routeMainLoop) return next(e)
+    announce($, ctx)
+    // Main-loop routing is off by default. Off means no call of any kind:
+    // nothing the person types is classified, sent, or even hashed.
+    if (!config.routeMainLoop) return next(e)
 
-    if (!unusableReported) {
-      unusableReported = true
-      $.ui.log(`[jev-model-router] provider "${forced}" has no key set; using the built-in classifier`)
-    }
+    // Only what the person typed. A notification, a peer's message, a
+    // schedule or another plugin's prompt is not theirs to route, and a
+    // command line or a bare slash command says nothing about the task.
+    if (e.isMeta || e.command || !fromPerson(e.origin) || bareCommand(e.text)) return next(e)
 
-    // A slash command alone gives the decision model only the command's name.
-    // Its turn keeps the session's model and effort; the null put keeps a
-    // previous prompt's decision from reaching it.
-    if (bareCommand(e.text)) {
-      if (logDecisions) $.ui.log('[jev-model-router] a command with nothing after it; leaving the turn alone')
-      pending.put(null)
+    if (config.mode === 'keyless') {
+      reportFailure($, ctx, 'no-key', 'main')
       return next(e)
     }
 
+    let outcome: Outcome
+    let counts: RedactCounts = {}
     const startedAt = await $.clock.now()
-    let decision: Decision | null = null
-    if (active) {
-      try {
-        const response = await Promise.race([
-          $.http.fetch(url, {
-            method: 'POST',
-            headers: requestHeaders(active, apiKey, modelId),
-            body: requestBody(active, { prompt: e.text }, modelId),
-          }),
-          $.clock.sleep(timeoutMs),
-        ])
-        if (response && response.ok) decision = readDecision(response.text)
-        else if (response) $.ui.log(`[jev-model-router] ${active} responded ${response.status}`)
-        else $.ui.log(`[jev-model-router] classification passed ${timeoutMs}ms; leaving the turn alone`)
-      } catch (error) {
-        $.ui.log(`[jev-model-router] classification failed: ${String(error)}`)
+    if (config.mode === 'jev') {
+      if (!breaker.allow(startedAt)) {
+        outcome = { decision: null, failure: 'circuit-open', fatal: false }
+      } else {
+        const built = buildPromptState(e.text, config)
+        counts = built.counts
+        outcome = await askJev($, config, built.state)
+        if (outcome.failure) breaker.failure(startedAt, outcome.fatal)
+        else breaker.success()
       }
     } else {
-      // No backend: the engine's own small-model classifier answers the same
-      // question, without the confidence the policy's threshold reads.
-      try {
-        const label = await $.model.classify(e.text, TIER_ORDER)
-        if (label) {
-          decision = {
-            tier: label as Tier,
-            confidence: null,
-            risky: null,
-            effort: null,
-            effortConfidence: null,
-          }
-        }
-      } catch (error) {
-        $.ui.log(`[jev-model-router] built-in classifier failed: ${String(error)}`)
-      }
+      const built = buildPromptState(e.text, config)
+      counts = built.counts
+      outcome = await askBuiltin($, built.state.prompt ?? '')
     }
 
-    // What the decision model actually answered, whatever the policy then
-    // does with it. This is the line that proves the classification ran.
-    if (logDecisions) {
+    if (outcome.failure) reportFailure($, ctx, outcome.failure, 'main')
+    if (config.logDecisions) {
       const ms = (await $.clock.now()) - startedAt
-      $.ui.log(`[jev-model-router] jev: ${describeDecision(decision, ms)}`)
+      const redacted = describeCounts(counts)
+      $.ui.log(`[jev-model-router] jev: ${describeDecision(outcome.decision, ms)}${redacted ? ` · ${redacted}` : ''}`)
     }
-
-    pending.put(decision)
+    pending.put(e.text, outcome.decision)
     return next(e)
   })
 
   on('turn.step', async function* ($, e, next) {
-    if (!routeMainLoop || e.agentId) return yield* next(e)
-
-    // Every request after the first reuses what the turn settled on, so
-    // neither the model nor the effort changes under its own tool loop.
-    if (e.index > 0 && e.turnId === appliedTurnId) {
-      return yield* next(applied ? { ...e, ...applied } : e)
-    }
-
-    const decision = pending.take()
-    const routing = route(decision, { model: e.model, effort: e.effort }, policy)
-    const change: { model?: string; effort?: Effort } = {}
-    // The main loop's `model` is sent to the API as written, so an alias
-    // becomes its id here; a subagent's (agent.spawn) may stay an alias.
-    if (routeMainModel && routing.model) change.model = requestModelId(routing.model)
-    if (routeMainEffort && routing.effort) change.effort = routing.effort
-
-    appliedTurnId = e.turnId
-    applied = Object.keys(change).length > 0 ? change : null
-    // A row in the transcript scrolls away; this line stays on screen.
-    if (logDecisions) $.ui.status(describeStatus(decision, applied))
-
-    if (!applied) {
-      // A turn left alone is the common case, and it used to be silent, which
-      // made a working mod look like one that never loaded. Say what happened.
-      if (logDecisions) {
-        const suppressed = routing.model && !routeMainModel ? ' (main-loop model routing off)' : ''
-        $.ui.log(`[jev-model-router] main loop: ${routing.reason}${suppressed}`)
+    // A subagent's step: its effort was decided at agent.spawn.
+    if (e.agentId) {
+      const wanted = plans.effortOf(e.agentId)
+      // A model without effort carries none to adjust.
+      if (wanted && e.effort !== undefined && e.effort !== wanted) {
+        return yield* next({ ...e, effort: wanted })
       }
       return yield* next(e)
     }
-    if (logDecisions) {
-      const what = [change.model, change.effort && `effort ${change.effort}`]
-        .filter(Boolean)
-        .join(', ')
-      $.ui.log(`[jev-model-router] main loop → ${what}: ${routing.reason}`)
+
+    if (!config.routeMainLoop) return yield* next(e)
+
+    // The first request of a turn settles the plan; every later one reuses it,
+    // so neither the model nor the effort changes under its own tool loop.
+    if (!mainPlans.has(e.turnId)) {
+      const decision = claimed.get(e.turnId) ?? null
+      claimed.delete(e.turnId)
+      const routing = route(decision, { model: e.model, effort: e.effort }, policy)
+      const change: { model?: string; effort?: Effort } = {}
+      // The main loop's `model` is sent to the API as written, so an alias
+      // becomes its id here; a subagent's (agent.spawn) stays an alias.
+      if (config.routeMainModel && routing.model) change.model = requestModelId(routing.model)
+      if (config.routeMainEffort && routing.effort) change.effort = routing.effort
+      const applied = Object.keys(change).length > 0 ? change : null
+      mainPlans.set(e.turnId, applied)
+      if (config.logDecisions) {
+        $.ui.status(describeStatus(decision, applied))
+        if (applied) {
+          const what = [applied.model, applied.effort && `effort ${applied.effort}`].filter(Boolean).join(', ')
+          $.ui.log(`[jev-model-router] main loop → ${what}: ${routing.reason}`)
+        } else {
+          const suppressed = routing.model && !config.routeMainModel ? ' (main-loop model routing off)' : ''
+          $.ui.log(`[jev-model-router] main loop: ${routing.reason}${suppressed}`)
+        }
+      }
     }
-    return yield* next({ ...e, ...change })
+    const applied = mainPlans.get(e.turnId) ?? null
+    return yield* next(applied ? { ...e, ...applied } : e)
   })
 
   on('agent.spawn', async ($, e, next) => {
-    // Before the routing guards: a module whose switches are all off has still
-    // loaded, and that is exactly when its silence is most misleading.
-    if (!announced) {
-      announced = true
-      if (logDecisions) {
-        $.ui.log(
-          `[jev-model-router] ${describeSetup(
-            active,
-            url,
-            {
-              subagentModel: routeSubagentModel,
-              mainEffort: routeMainEffort,
-              mainModel: routeMainModel,
-            },
-            forced === 'builtin',
-          )}`,
-        )
+    announce($, ctx)
+    if (!config.routeSubagentModel && !config.routeSubagentEffort) return next(e)
+
+    // Forks, teammates, resumes and hidden-script workflow agents: no call.
+    const skip = skipReason(e, guard)
+    if (skip) {
+      if (config.logDecisions) {
+        $.ui.log(`[jev-model-router] ${e.subagentType}: left alone, ${skip}`, { to: 'debug' })
       }
-    }
-
-    // A fork inherits its parent's model; `model` is ignored for it.
-    if (!routeSubagentModel || e.fork) return next(e)
-
-    if (!unusableReported) {
-      unusableReported = true
-      $.ui.log(`[jev-model-router] provider "${forced}" has no key set; using the built-in classifier`)
-    }
-
-    const startedAt = await $.clock.now()
-    let decision: Decision | null = null
-    if (active) {
-      try {
-        const response = await Promise.race([
-          $.http.fetch(url, {
-            method: 'POST',
-            headers: requestHeaders(active, apiKey, modelId),
-            body: requestBody(
-              active,
-              { prompt: e.prompt, description: e.description, agentType: e.subagentType },
-              modelId,
-            ),
-          }),
-          $.clock.sleep(timeoutMs),
-        ])
-        if (response && response.ok) decision = readDecision(response.text)
-        else if (response) $.ui.log(`[jev-model-router] ${active} responded ${response.status}`)
-        else $.ui.log(`[jev-model-router] classification passed ${timeoutMs}ms; leaving the subagent alone`)
-      } catch (error) {
-        $.ui.log(`[jev-model-router] classification failed: ${String(error)}`)
-      }
-    } else {
-      try {
-        const label = await $.model.classify(e.prompt, TIER_ORDER)
-        if (label) {
-          decision = {
-            tier: label as Tier,
-            confidence: null,
-            risky: null,
-            effort: null,
-            effortConfidence: null,
-          }
-        }
-      } catch (error) {
-        $.ui.log(`[jev-model-router] built-in classifier failed: ${String(error)}`)
-      }
-    }
-
-    if (logDecisions) {
-      const ms = (await $.clock.now()) - startedAt
-      $.ui.log(`[jev-model-router] jev (${e.subagentType}): ${describeDecision(decision, ms)}`)
-    }
-
-    // The subagent's own model wins when the caller named one; otherwise it
-    // would inherit the parent's, so that is what a change is measured from.
-    // The Agent tool takes no effort, so only the model is ours to set here.
-    const current = e.model ?? e.parentModel
-    const { model, reason } = route(decision, { model: current }, policy)
-    if (!model) {
-      if (logDecisions) $.ui.log(`[jev-model-router] ${e.subagentType}: ${reason}`)
       return next(e)
     }
-    if (logDecisions) $.ui.log(`[jev-model-router] ${e.subagentType} → ${model}: ${reason}`)
-    return next({ ...e, model })
+
+    // 1. A decision: from the cache, from Jev, from the built-in classifier,
+    //    or none (and then why).
+    const key = hashKey(e.subagentType, e.description, e.prompt)
+    let decision: Decision | null = cache.get(key) ?? null
+    let failure: string | null = null
+    let counts: RedactCounts = {}
+    const startedAt = await $.clock.now()
+    let cached = decision !== null
+
+    if (!decision) {
+      if (config.mode === 'keyless') {
+        failure = 'no-key'
+      } else if (config.mode === 'jev' && !breaker.allow(startedAt)) {
+        failure = 'circuit-open'
+      } else {
+        const built = buildSubagentState(e, config)
+        counts = built.counts
+        const outcome =
+          config.mode === 'jev'
+            ? await askJev($, config, built.state)
+            : await askBuiltin($, built.state.prompt ?? '')
+        decision = outcome.decision
+        failure = outcome.failure
+        if (config.mode === 'jev') {
+          if (failure) breaker.failure(startedAt, outcome.fatal)
+          else breaker.success()
+        }
+        if (decision) cache.set(key, decision)
+      }
+    }
+    cached = cached && decision !== null
+
+    if (failure) reportFailure($, ctx, failure, 'subagent')
+    if (config.logDecisions) {
+      const ms = (await $.clock.now()) - startedAt
+      const redacted = describeCounts(counts)
+      const shown = failure ?? describeDecision(decision, cached ? null : ms)
+      $.ui.log(
+        `[jev-model-router] jev (${e.subagentType}${cached ? ', cached' : ''}): ${shown}${redacted ? ` · ${redacted}` : ''}`,
+      )
+    }
+
+    // 2. What it means for this subagent. A model is ALWAYS named: the
+    //    caller's own (callers pass a default) and the parent's are replaced.
+    const routing = decision ? routeSubagent(decision, policy) : fallbackRouting(policy, failure ?? 'no decision')
+    const model = config.routeSubagentModel ? routing.model : undefined
+    const effort = config.routeSubagentEffort ? routing.effort : undefined
+
+    // 3. Start it, filing the effort under the prompt first (the agent's own
+    //    turn.start may come before `next` returns) and under its id after.
+    const promptKey = hashKey(e.prompt)
+    if (effort) plans.expect(promptKey, effort)
+    let result
+    try {
+      result = await next(model ? { ...e, model } : e)
+    } catch (error) {
+      if (effort) plans.cancel(promptKey, effort)
+      throw error
+    }
+    if (result.deny !== undefined) {
+      if (effort) plans.cancel(promptKey, effort)
+      return result
+    }
+    if (effort && result.agentId) plans.bind(result.agentId, promptKey, effort)
+
+    if (config.logDecisions) {
+      const what = [model, effort].filter(Boolean).join('/')
+      $.ui.log(`[jev-model-router] ${e.subagentType} → ${what}${routing.fallback ? ' (fallback)' : ''}: ${routing.reason}`)
+    }
+
+    // 4. If the session forces a subagent model (CLAUDE_CODE_SUBAGENT_MODEL
+    //    outranks a hook for some spawns), say so once instead of pretending.
+    if (model) {
+      const chosen = rankOf(model)
+      const ran = rankOf(result.model)
+      if (chosen !== null && ran !== null && chosen !== ran) {
+        const { show } = notifier.report('override')
+        if (show) {
+          loud(
+            $,
+            `${describeFailure('override', 1, config)}: wanted ${model}, it runs on ${result.model}`,
+          )
+        }
+      }
+    }
+    return result
   })
 }

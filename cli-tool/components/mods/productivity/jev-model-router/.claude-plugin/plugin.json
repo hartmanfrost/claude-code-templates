@@ -1,7 +1,7 @@
 {
   "name": "jev-model-router",
-  "version": "0.4.2",
-  "description": "Picks the model and the reasoning effort for each task with TypeSafe's Jev, a System One decision model reached either through TypeSafe's own API or the Vercel AI Gateway. Routes subagent models at agent.spawn and the main loop's effort and model at turn.step, in both directions, falling back to the engine's built-in classifier when no key is set.",
+  "version": "0.5.0-hartmanfrost.1",
+  "description": "Picks the model and the reasoning effort of each SUBAGENT (Agent tool and Workflow agent()) with TypeSafe's Jev, a System One decision model reached through TypeSafe's API or the Vercel AI Gateway. The main conversation is not routed unless switched on. Candidates are haiku, sonnet and opus only. When Jev cannot decide, subagents run on a configurable fallback model and effort and the failure is shown. Everything sent out is secret-redacted first.",
   "author": {
     "name": "claude-code-templates",
     "url": "https://www.aitmpl.com"
@@ -12,7 +12,9 @@
     "mod",
     "function-hooks",
     "productivity",
-    "routing"
+    "routing",
+    "subagents",
+    "privacy"
   ],
   "userConfig": {
     "typesafeApiKey": {
@@ -25,14 +27,14 @@
     "gatewayApiKey": {
       "type": "string",
       "title": "Vercel AI Gateway API key",
-      "description": "Key for the AI Gateway; with none set the engine's built-in classifier is used instead",
+      "description": "Key for the AI Gateway; with no key at all, subagents run on the fallback model and effort (see fallbackModel)",
       "default": "",
       "sensitive": true
     },
     "provider": {
       "type": "string",
       "title": "Backend",
-      "description": "Which backend to use; \"auto\" picks TypeSafe when its key is set, then the Gateway, then the built-in classifier",
+      "description": "Which backend to use; \"auto\" picks TypeSafe when its key is set, then the Gateway, otherwise no call is made. \"builtin\" uses the engine's own classifier (no Jev, no confidence) and must be chosen explicitly",
       "default": "auto",
       "options": [
         "auto",
@@ -44,7 +46,7 @@
     "typesafeBaseUrl": {
       "type": "string",
       "title": "TypeSafe base URL",
-      "description": "Base URL of TypeSafe's own API; empty uses https://api.typesafe.ai",
+      "description": "Base URL of TypeSafe's own API; empty uses https://api.typesafe.ai. Must be https (http only for localhost); anything else is ignored",
       "default": ""
     },
     "typesafeModel": {
@@ -56,7 +58,7 @@
     "gatewayBaseUrl": {
       "type": "string",
       "title": "AI Gateway base URL",
-      "description": "Base URL of the AI Gateway; empty uses https://ai-gateway.vercel.sh/v4/ai",
+      "description": "Base URL of the AI Gateway; empty uses https://ai-gateway.vercel.sh/v4/ai. Must be https (http only for localhost); anything else is ignored",
       "default": ""
     },
     "gatewayModel": {
@@ -68,61 +70,141 @@
     "fastModel": {
       "type": "string",
       "title": "Fast tier",
-      "description": "Model alias or id for mechanical, local tasks",
-      "default": "haiku"
+      "description": "Model for mechanical, local tasks: haiku, sonnet or opus",
+      "default": "haiku",
+      "options": [
+        "haiku",
+        "sonnet",
+        "opus"
+      ]
     },
     "balancedModel": {
       "type": "string",
       "title": "Balanced tier",
-      "description": "Model alias or id for ordinary engineering work",
-      "default": "sonnet"
+      "description": "Model for ordinary engineering work",
+      "default": "sonnet",
+      "options": [
+        "haiku",
+        "sonnet",
+        "opus"
+      ]
     },
     "deepModel": {
       "type": "string",
       "title": "Deep tier",
-      "description": "Model alias or id for hard or high-stakes work",
-      "default": "opus"
+      "description": "Model for hard or high-stakes work",
+      "default": "opus",
+      "options": [
+        "haiku",
+        "sonnet",
+        "opus"
+      ]
     },
     "minUpgradeConfidence": {
       "type": "number",
       "title": "Confidence to spend more",
-      "description": "How sure the decision must be to raise the model or the effort; being wrong here costs money, so the bar is low",
+      "description": "How sure Jev must be to pick a model or effort ABOVE the fallback (0 to 1); being wrong costs money, so the bar is low",
       "default": 0.3
     },
     "minDowngradeConfidence": {
       "type": "number",
       "title": "Confidence to spend less",
-      "description": "How sure it must be to lower the model or the effort; being wrong here means a task gets too little, so the bar is high",
+      "description": "How sure Jev must be to pick a model or effort BELOW the fallback (0 to 1); being wrong means too little for the task, so the bar is high",
       "default": 0.6
+    },
+    "fallbackModel": {
+      "type": "string",
+      "title": "Fallback model",
+      "description": "What a subagent runs on when Jev gives no usable decision (error, timeout, no key)",
+      "default": "opus",
+      "options": [
+        "haiku",
+        "sonnet",
+        "opus"
+      ]
+    },
+    "fallbackEffort": {
+      "type": "string",
+      "title": "Fallback effort",
+      "description": "The effort of a subagent when Jev gives no usable decision",
+      "default": "medium",
+      "options": [
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ]
     },
     "routeSubagentModel": {
       "type": "boolean",
       "title": "Route subagent models",
-      "description": "Pick the model of each subagent at agent.spawn (the Agent tool takes no effort)",
+      "description": "Pick the model of each subagent at agent.spawn, overriding the model the caller passed",
+      "default": true
+    },
+    "routeSubagentEffort": {
+      "type": "boolean",
+      "title": "Route subagent effort",
+      "description": "Set each subagent's reasoning effort (low, medium, high or xhigh; never max) at its turn.step",
       "default": true
     },
     "routeMainEffort": {
       "type": "boolean",
       "title": "Route the main loop's effort",
-      "description": "Raise or lower the reasoning effort of the main conversation",
-      "default": true
+      "description": "Raise or lower the reasoning effort of the main conversation. Off by default: it sends your typed prompts to Jev",
+      "default": false
     },
     "routeMainModel": {
       "type": "boolean",
       "title": "Route the main loop's model",
-      "description": "Change the model of the main conversation; off by default because switching models mid-session invalidates the prompt cache",
+      "description": "Change the model of the main conversation. Off by default: it sends your typed prompts to Jev, and switching models mid-session invalidates the prompt cache",
       "default": false
     },
     "timeoutMs": {
       "type": "number",
       "title": "Latency budget (ms)",
-      "description": "How long to wait for a decision before letting the request through unchanged",
-      "default": 800
+      "description": "How long a spawn waits for a decision, 100 to 30000; past it the fallback applies and the failure is shown",
+      "default": 1500
+    },
+    "maxPromptChars": {
+      "type": "number",
+      "title": "Max prompt characters sent",
+      "description": "The subagent prompt is cut to this many characters (200 to 20000) after redaction, before it is sent",
+      "default": 4000
+    },
+    "redactSensitive": {
+      "type": "boolean",
+      "title": "Redact secrets before sending",
+      "description": "Replace API keys, tokens, private keys, credentials in URLs, secret assignments and high-entropy blobs with [REDACTED:type] placeholders in everything sent to Jev. Best effort, not a guarantee",
+      "default": true
+    },
+    "redactEmails": {
+      "type": "boolean",
+      "title": "Also redact email addresses",
+      "description": "Off by default",
+      "default": false
+    },
+    "redactIps": {
+      "type": "boolean",
+      "title": "Also redact IP addresses",
+      "description": "IPv4 and IPv6. Off by default",
+      "default": false
+    },
+    "redactHomePaths": {
+      "type": "boolean",
+      "title": "Also shorten home paths",
+      "description": "/home/<user> and /Users/<user> become ~. Off by default",
+      "default": false
+    },
+    "redactPatterns": {
+      "type": "string",
+      "title": "Extra redaction patterns",
+      "description": "Your own regular expressions, one per line (or a JSON array of strings). Each match is replaced with [REDACTED:custom]. Invalid or backtracking-prone patterns are skipped and reported",
+      "default": ""
     },
     "logDecisions": {
       "type": "boolean",
       "title": "Log decisions",
-      "description": "Write each routing decision to the session log",
+      "description": "Write each routing decision to the transcript. Failures are always shown, whatever this says",
       "default": true
     }
   }

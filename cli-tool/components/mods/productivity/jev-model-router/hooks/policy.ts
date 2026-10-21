@@ -1,9 +1,10 @@
 /**
  * jev-model-router — pure decision logic.
  *
- * No `$` and no I/O here: this module only builds the request the decision
- * API takes, reads its answer, and turns that answer into a model id. The
- * hooks module does every call on `$` at its own call site.
+ * No `$` and no I/O here: this module validates the options, builds the
+ * request the decision API takes, reads its answer, and turns that answer
+ * into a subagent's model and effort. The hooks module does every call on
+ * `$`.
  *
  * Two backends speak to the same model with different wire shapes:
  *
@@ -19,14 +20,22 @@
  * @ai-sdk/gateway and @ai-sdk/provider.
  */
 
+import { DEFAULT_REDACT, compileCustomPatterns, mergeCounts, prepareField } from './redact.ts'
+import type { RedactCounts, RedactOptions } from './redact.ts'
+
 export type Provider = 'typesafe' | 'gateway'
+
+/** The only models the router ever picks. Never anything else. */
+export type Family = 'haiku' | 'sonnet' | 'opus'
+
+export const FAMILIES: readonly Family[] = ['haiku', 'sonnet', 'opus']
 
 export type Tier = 'fast' | 'balanced' | 'deep'
 
 export interface Tiers {
-  fast: string
-  balanced: string
-  deep: string
+  fast: Family
+  balanced: Family
+  deep: Family
 }
 
 export interface Decision {
@@ -163,7 +172,7 @@ export function requestHeaders(
   }
 }
 
-function isTier(value: unknown): value is Tier {
+export function isTier(value: unknown): value is Tier {
   return value === 'fast' || value === 'balanced' || value === 'deep'
 }
 
@@ -183,28 +192,30 @@ export function readDecision(responseText: string): Decision | null {
   } catch {
     return null
   }
+  if (typeof parsed !== 'object' || parsed === null) return null
   const answers = (parsed as { answers?: Record<string, Record<string, unknown>> }).answers
-  if (!answers) return null
+  if (typeof answers !== 'object' || answers === null) return null
 
   const tierAnswer = answers.tier
   if (!tierAnswer || !isTier(tierAnswer.choice)) return null
 
   const effortAnswer = answers.effort
   const riskyAnswer = answers.risky
-  const risky =
-    typeof riskyAnswer?.noul === 'number'
-      ? riskyAnswer.noul
-      : typeof riskyAnswer?.probability === 'number'
-        ? riskyAnswer.probability
-        : null
+  const risky = unit(riskyAnswer?.noul) ?? unit(riskyAnswer?.probability)
+  const score = effortAnswer?.score
 
   return {
     tier: tierAnswer.choice,
     confidence: confidenceOf(tierAnswer),
-    effort: typeof effortAnswer?.score === 'number' ? effortAnswer.score : null,
+    effort: typeof score === 'number' && Number.isFinite(score) ? Math.min(3, Math.max(0, score)) : null,
     effortConfidence: effortAnswer ? confidenceOf(effortAnswer) : null,
     risky,
   }
+}
+
+/** A probability: a finite number in 0..1, anything else reads as absent. */
+function unit(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 1 ? value : null
 }
 
 /**
@@ -212,9 +223,13 @@ export function readDecision(responseText: string): Decision | null {
  * it is the highest probability of a distribution that is itself optional.
  */
 function confidenceOf(answer: Record<string, unknown>): number | null {
-  if (typeof answer.confidence === 'number') return answer.confidence
-  const probabilities = answer.probabilities as Record<string, number> | undefined
-  const values = probabilities ? Object.values(probabilities) : []
+  const reported = unit(answer.confidence)
+  if (reported !== null) return reported
+  const probabilities = answer.probabilities
+  if (typeof probabilities !== 'object' || probabilities === null) return null
+  const values = Object.values(probabilities as Record<string, unknown>)
+    .map(unit)
+    .filter((v): v is number => v !== null)
   return values.length > 0 ? Math.max(...values) : null
 }
 
@@ -237,23 +252,29 @@ export function effortRank(effort: string | number | undefined): number | null {
   return index === -1 ? null : index
 }
 
+
+// ---- models --------------------------------------------------------------
+
 /**
- * Where a model id sits on the tier ladder, by matching it against the
- * configured tier names first and then the family words. Null when it matches
- * none, in which case the change is treated as an upgrade rather than guessed
- * at: an unrecognised id gets the gentler threshold, never the strict one.
+ * Where a model sits on the ladder, by the family word in its name; null for
+ * anything else. The router only ever picks the three families, and never
+ * touches a model it cannot place (`fable`, a custom id): comparing ranks is
+ * what makes `claude-opus-5-5[1m]` and `opus` the same tier.
  */
-export function rankOf(model: string, tiers: Tiers): number | null {
+export function rankOf(model: string): number | null {
   const lowered = model.toLowerCase()
-  for (let index = 0; index < TIER_ORDER.length; index++) {
-    const tier = TIER_ORDER[index] as Tier
-    const configured = tiers[tier].toLowerCase()
-    if (configured && lowered.includes(configured)) return index
-  }
+  if (lowered.includes('fable')) return null
   if (lowered.includes('haiku')) return 0
   if (lowered.includes('sonnet')) return 1
   if (lowered.includes('opus')) return 2
   return null
+}
+
+/** An option value as a family alias, or null (also for anything `fable`). */
+export function parseFamily(value: unknown): Family | null {
+  if (typeof value !== 'string') return null
+  const v = value.trim().toLowerCase()
+  return (FAMILIES as readonly string[]).includes(v) ? (v as Family) : null
 }
 
 /**
@@ -261,38 +282,206 @@ export function rankOf(model: string, tiers: Tiers): number | null {
  *
  * `agent.spawn` takes an alias (`haiku`) the way the Agent tool does, but
  * `turn.step`'s `model` is the id the engine already resolved for the request
- * and goes to the API as written: an alias there is refused ("There's an
- * issue with the selected model (haiku)"). So the tiers stay aliases in the
- * options, and only a main-loop rewrite resolves them, here.
+ * and goes to the API as written: an alias there is refused. So the tiers stay
+ * aliases in the options, and only a main-loop rewrite resolves them, here.
+ * The ids are the ones Claude Code 2.1.305 reported for these aliases.
  */
 const ALIAS_IDS: Record<string, string> = {
-  haiku: 'claude-haiku-4-5-20251001',
-  sonnet: 'claude-sonnet-5',
-  opus: 'claude-opus-5',
+  haiku: 'claude-haiku-5-5',
+  sonnet: 'claude-sonnet-5-5',
+  opus: 'claude-opus-5-5',
 }
 
-/**
- * What to write into `turn.step`'s `model`: a full id as given, or the id
- * behind a family alias. Anything else is returned unchanged for the engine
- * to judge.
- */
+/** What to write into `turn.step`'s `model`: the id behind a family alias. */
 export function requestModelId(model: string): string {
   return ALIAS_IDS[model.trim().toLowerCase()] ?? model
 }
 
+// ---- options -------------------------------------------------------------
+
 export interface PolicyConfig {
   tiers: Tiers
   /**
-   * How sure the decision must be to spend more (a bigger model, more
-   * reasoning). Being wrong here costs money, so the bar is low.
+   * How sure the decision must be to spend more than the fallback (a bigger
+   * model, more reasoning). Being wrong here costs money, so the bar is low.
    */
   minUpgradeConfidence: number
   /**
-   * How sure it must be to spend less. Being wrong here means a task handled
-   * by too small a model or too little thought, so the bar is high.
+   * How sure it must be to spend less than the fallback. Being wrong means a
+   * task handled by too small a model or too little thought, so the bar is high.
    */
   minDowngradeConfidence: number
+  /** What a subagent runs on when there is no usable decision. */
+  fallbackModel: Family
+  fallbackEffort: Effort
 }
+
+/** `keyless`: no key for the chosen backend; subagents get the fallback. */
+export type Mode = 'jev' | 'builtin' | 'keyless'
+
+export interface RouterConfig {
+  mode: Mode
+  /** The provider the key belongs to, or null. */
+  provider: Provider | null
+  /** The `provider` option as given (`auto` by default). */
+  forced: string
+  apiKey: string
+  modelId: string
+  url: string
+  policy: PolicyConfig
+  routeSubagentModel: boolean
+  routeSubagentEffort: boolean
+  routeMainEffort: boolean
+  routeMainModel: boolean
+  routeMainLoop: boolean
+  timeoutMs: number
+  logDecisions: boolean
+  maxPromptChars: number
+  redactSensitive: boolean
+  redact: RedactOptions
+}
+
+/** Why a base URL may not receive the key, or null when it may. */
+export function validateBaseUrl(raw: string): string | null {
+  let url: URL
+  try {
+    url = new URL(raw)
+  } catch {
+    return 'not a valid URL'
+  }
+  if (url.username || url.password) return 'must not contain credentials'
+  if (url.protocol === 'https:') return null
+  const host = url.hostname
+  const loopback = host === 'localhost' || host === '[::1]' || /^127\.\d+\.\d+\.\d+$/.test(host)
+  if (url.protocol === 'http:' && loopback) return null
+  return 'must be https (plain http only for localhost)'
+}
+
+type RawOptions = Record<string, unknown>
+
+/**
+ * Reads and validates the plugin's options. A value that is the wrong type,
+ * out of range or not an allowed choice falls back to its default and is
+ * reported in `warnings` (the caller shows them), never silently.
+ */
+export function resolveOptions(options: RawOptions): { config: RouterConfig; warnings: string[] } {
+  const warnings: string[] = []
+  const given = (key: string) => options[key] !== undefined && options[key] !== ''
+
+  const text = (key: string, fallback: string) =>
+    typeof options[key] === 'string' && options[key] ? (options[key] as string).trim() : fallback
+
+  const flag = (key: string, fallback: boolean) => {
+    const v = options[key]
+    if (typeof v === 'boolean') return v
+    if (given(key)) warnings.push(`${key}: expected true or false, using ${fallback}`)
+    return fallback
+  }
+
+  const ranged = (key: string, fallback: number, min: number, max: number) => {
+    const v = options[key]
+    if (typeof v === 'number' && Number.isFinite(v) && v >= min && v <= max) return v
+    if (given(key)) warnings.push(`${key}: expected a number from ${min} to ${max}, using ${fallback}`)
+    return fallback
+  }
+
+  const family = (key: string, fallback: Family): Family => {
+    if (!given(key)) return fallback
+    const parsed = parseFamily(options[key])
+    if (parsed) return parsed
+    warnings.push(`${key}: only haiku, sonnet or opus are allowed, using ${fallback}`)
+    return fallback
+  }
+
+  const effort = (key: string, fallback: Effort): Effort => {
+    if (!given(key)) return fallback
+    const v = typeof options[key] === 'string' ? (options[key] as string).trim().toLowerCase() : ''
+    if ((EFFORT_ORDER as readonly string[]).includes(v)) return v as Effort
+    warnings.push(`${key}: only low, medium, high or xhigh are allowed, using ${fallback}`)
+    return fallback
+  }
+
+  const typesafeKey = text('typesafeApiKey', '')
+  const gatewayKey = text('gatewayApiKey', '')
+  let forced = text('provider', 'auto')
+  if (!['auto', 'typesafe', 'gateway', 'builtin'].includes(forced)) {
+    warnings.push(`provider: "${forced}" is not auto, typesafe, gateway or builtin, using auto`)
+    forced = 'auto'
+  }
+  const provider = selectProvider(forced, typesafeKey, gatewayKey)
+  const mode: Mode = forced === 'builtin' ? 'builtin' : provider ? 'jev' : 'keyless'
+
+  const baseUrl = (key: string, fallback: string) => {
+    const raw = text(key, '')
+    if (!raw) return fallback
+    const problem = validateBaseUrl(raw)
+    if (problem) {
+      warnings.push(`${key}: ${problem}, using ${fallback}`)
+      return fallback
+    }
+    return raw
+  }
+
+  const url = !provider
+    ? ''
+    : provider === 'typesafe'
+      ? endpoint('typesafe', baseUrl('typesafeBaseUrl', DEFAULT_BASE_URL.typesafe))
+      : endpoint('gateway', baseUrl('gatewayBaseUrl', DEFAULT_BASE_URL.gateway))
+  const modelId = !provider
+    ? ''
+    : provider === 'typesafe'
+      ? text('typesafeModel', DEFAULT_MODEL.typesafe)
+      : text('gatewayModel', DEFAULT_MODEL.gateway)
+
+  const custom = compileCustomPatterns(options.redactPatterns)
+  warnings.push(...custom.errors)
+
+  const redactSensitive = flag('redactSensitive', true)
+  const routeMainEffort = flag('routeMainEffort', false)
+  const routeMainModel = flag('routeMainModel', false)
+
+  const config: RouterConfig = {
+    mode,
+    provider,
+    forced,
+    apiKey: provider === 'typesafe' ? typesafeKey : provider === 'gateway' ? gatewayKey : '',
+    modelId,
+    url,
+    policy: {
+      tiers: {
+        fast: family('fastModel', 'haiku'),
+        balanced: family('balancedModel', 'sonnet'),
+        deep: family('deepModel', 'opus'),
+      },
+      minUpgradeConfidence: ranged('minUpgradeConfidence', 0.3, 0, 1),
+      minDowngradeConfidence: ranged('minDowngradeConfidence', 0.6, 0, 1),
+      fallbackModel: family('fallbackModel', 'opus'),
+      fallbackEffort: effort('fallbackEffort', 'medium'),
+    },
+    routeSubagentModel: flag('routeSubagentModel', true),
+    routeSubagentEffort: flag('routeSubagentEffort', true),
+    routeMainEffort,
+    routeMainModel,
+    routeMainLoop: routeMainEffort || routeMainModel,
+    timeoutMs: ranged('timeoutMs', 1500, 100, 30000),
+    logDecisions: flag('logDecisions', true),
+    maxPromptChars: ranged('maxPromptChars', 4000, 200, 20000),
+    redactSensitive,
+    redact: {
+      ...DEFAULT_REDACT,
+      enabled: redactSensitive,
+      emails: flag('redactEmails', false),
+      ips: flag('redactIps', false),
+      homePaths: flag('redactHomePaths', false),
+      custom: custom.patterns,
+    },
+  }
+  return { config, warnings }
+}
+
+// ---- deciding ------------------------------------------------------------
+
+const RISKY_BAR = 0.7
 
 export interface Routing {
   /** The model to run on, or null to leave the request as it is. */
@@ -327,9 +516,16 @@ function allowed(
   return confidence >= bar
 }
 
+function said(confidence: number | null): string {
+  return confidence === null ? 'confidence n/d' : `confidence ${confidence.toFixed(2)}`
+}
+
 /**
- * Turns a decision into a model and a reasoning level, either of which may be
- * null to leave the request as it is. Both can move in either direction.
+ * Turns a decision into a model and a reasoning level for the MAIN loop,
+ * either of which may be null to leave the request as it is. Both can move in
+ * either direction. Models are compared by rank, never by string, so the
+ * session's `claude-opus-5-5[1m]` is the deep tier and keeps its suffix; a
+ * model the router cannot place (`fable`) is never touched.
  */
 export function route(
   decision: Decision | null,
@@ -345,107 +541,480 @@ export function route(
   // Carrying out something final is never worth the saving: take the deep
   // tier and real reasoning, whatever the cheaper answer said, and skip the
   // thresholds — this is the one case that is not a confidence question.
-  if (decision.risky !== null && decision.risky > 0.7) {
+  if (decision.risky !== null && decision.risky > RISKY_BAR) {
     tier = 'deep'
     effortScore = Math.max(effortScore ?? 0, 2)
     forced = true
   }
 
-  const wantedTier = TIER_ORDER.indexOf(tier)
-  const currentTier = rankOf(current.model, config.tiers)
   const wantedModel = config.tiers[tier]
+  const wantedRank = rankOf(wantedModel)
+  const currentRank = rankOf(current.model)
 
   const model =
-    wantedModel &&
-    wantedModel !== current.model &&
-    (forced || allowed(wantedTier, currentTier, decision.confidence, config))
+    wantedRank !== null &&
+    currentRank !== null &&
+    wantedRank !== currentRank &&
+    (forced || allowed(wantedRank, currentRank, decision.confidence, config))
       ? wantedModel
       : null
 
   let effort: Effort | null = null
-  if (effortScore !== null) {
-    const currentRank = effortRank(current.effort)
-    let wantedRank = EFFORT_ORDER.indexOf(effortLevel(effortScore))
-
-    // Risk raises the floor; it must never lower one. Forcing only skips the
-    // thresholds, so without this clamp a task already at `xhigh` or `max`
-    // and rated mechanically simple would be pulled down to `high` with no
-    // confidence check at all — the opposite of what the rule is for.
-    if (forced && currentRank !== null) wantedRank = Math.max(wantedRank, currentRank)
-
-    // A numeric effort is the caller's own scale, not this ladder; leave it.
-    const comparable = typeof current.effort !== 'number'
-    const wanted = EFFORT_ORDER[Math.min(EFFORT_ORDER.length - 1, wantedRank)] as Effort
+  // A model without effort (the request carries none) has nothing to adjust,
+  // and a numeric effort is the caller's own scale, not this ladder.
+  if (effortScore !== null && typeof current.effort === 'string') {
+    const currentEffortRank = effortRank(current.effort)
+    let wantedEffortRank = EFFORT_ORDER.indexOf(effortLevel(effortScore))
+    // Risk raises the floor; it must never lower one.
+    if (forced && currentEffortRank !== null) wantedEffortRank = Math.max(wantedEffortRank, currentEffortRank)
     if (
-      comparable &&
-      wantedRank !== currentRank &&
-      (forced || allowed(wantedRank, currentRank, decision.effortConfidence, config))
+      wantedEffortRank !== currentEffortRank &&
+      (forced || allowed(wantedEffortRank, currentEffortRank, decision.effortConfidence, config))
     ) {
-      effort = wanted
+      effort = EFFORT_ORDER[Math.min(EFFORT_ORDER.length - 1, wantedEffortRank)] as Effort
     }
   }
 
-  const said = decision.confidence === null ? 'confidence n/d' : `confidence ${decision.confidence.toFixed(2)}`
-
   if (!model && !effort) {
-    // Naming what it wanted and what it kept is the whole point of this line.
-    // Without it, a mod that classified and decided to leave the request alone
-    // is indistinguishable from one that never loaded.
     const wantedEffort = effortScore === null ? null : effortLevel(effortScore)
     const kept = `${current.model}${current.effort === undefined ? '' : `/${current.effort}`}`
     const wanted = `${wantedModel}${wantedEffort ? `/${wantedEffort}` : ''}`
-    return { model: null, effort: null, reason: `kept ${kept}, wanted ${wanted} (${said})` }
+    return { model: null, effort: null, reason: `kept ${kept}, wanted ${wanted} (${said(decision.confidence)})` }
+  }
+  return { model, effort, reason: forced ? `${tier}, forced by risk` : `${tier} (${said(decision.confidence)})` }
+}
+
+export interface SubagentRouting {
+  /** Always set: the router names the model explicitly, whatever the caller passed. */
+  model: Family
+  effort: Effort
+  reason: string
+  /** True when no decision was used and the configured fallback applies. */
+  fallback: boolean
+}
+
+/** What a subagent runs on when there is no usable decision. */
+export function fallbackRouting(config: PolicyConfig, reason: string): SubagentRouting {
+  return { model: config.fallbackModel, effort: config.fallbackEffort, reason, fallback: true }
+}
+
+/**
+ * The model and effort for one subagent. There is no "current" model to
+ * measure a change from: the caller's own `model` is overridden (callers pass
+ * `sonnet` as a default, and the session's parent model says nothing about
+ * what a subagent would have run on), so the decision is measured against the
+ * FALLBACK, the configured default. A decision that agrees with it, or that
+ * does not clear its bar, yields the fallback; one that does, yields its own
+ * tier in either direction. `risky` takes the deep tier (never lower than the
+ * fallback) and real reasoning past every bar.
+ */
+export function routeSubagent(decision: Decision | null, config: PolicyConfig): SubagentRouting {
+  if (!decision) return fallbackRouting(config, 'no decision')
+
+  let tier = decision.tier
+  let score = decision.effort
+  let forced = false
+  if (decision.risky !== null && decision.risky > RISKY_BAR) {
+    tier = 'deep'
+    score = Math.max(score ?? 0, 2)
+    forced = true
   }
 
-  return { model, effort, reason: forced ? `${tier}, forced by risk` : `${tier} (${said})` }
+  const fallbackModelRank = rankOf(config.fallbackModel) as number
+  const wantedModel = config.tiers[tier]
+  const wantedRank = rankOf(wantedModel) as number
+
+  let model: Family = config.fallbackModel
+  if (forced) {
+    model = wantedRank >= fallbackModelRank ? wantedModel : config.fallbackModel
+  } else if (allowed(wantedRank, fallbackModelRank, decision.confidence, config)) {
+    model = wantedModel
+  }
+
+  const fallbackEffortRank = EFFORT_ORDER.indexOf(config.fallbackEffort)
+  let effort: Effort = config.fallbackEffort
+  let wantedEffort: Effort | null = null
+  if (score !== null) {
+    wantedEffort = effortLevel(score)
+    let wantedEffortRank = EFFORT_ORDER.indexOf(wantedEffort)
+    if (forced) {
+      wantedEffortRank = Math.max(wantedEffortRank, fallbackEffortRank)
+      effort = EFFORT_ORDER[wantedEffortRank] as Effort
+    } else if (allowed(wantedEffortRank, fallbackEffortRank, decision.effortConfidence, config)) {
+      effort = wantedEffort
+    }
+  }
+
+  const stayed = !forced && (model !== wantedModel || (wantedEffort !== null && effort !== wantedEffort))
+  const reason = forced
+    ? `${tier}, forced by risk`
+    : stayed
+      ? `kept ${model}/${effort}, wanted ${wantedModel}${wantedEffort ? `/${wantedEffort}` : ''} (${said(decision.confidence)})`
+      : `${tier} (${said(decision.confidence)})`
+  return { model, effort, reason, fallback: false }
+}
+
+// ---- what leaves the machine ----------------------------------------------
+
+/** The state sent to the decision model for a subagent, redacted then truncated. */
+export function buildSubagentState(
+  spawn: { prompt: string; description: string; subagentType: string },
+  config: Pick<RouterConfig, 'redact' | 'maxPromptChars'>,
+): { state: Record<string, string>; counts: RedactCounts } {
+  const counts: RedactCounts = {}
+  const field = (text: string, max: number) => {
+    const out = prepareField(text, max, config.redact)
+    mergeCounts(counts, out.counts)
+    return out.text
+  }
+  return {
+    state: {
+      prompt: field(spawn.prompt, config.maxPromptChars),
+      description: field(spawn.description, 500),
+      agentType: field(spawn.subagentType, 100),
+    },
+    counts,
+  }
+}
+
+/** The state sent for a main-loop prompt. */
+export function buildPromptState(
+  text: string,
+  config: Pick<RouterConfig, 'redact' | 'maxPromptChars'>,
+): { state: Record<string, string>; counts: RedactCounts } {
+  const out = prepareField(text, config.maxPromptChars, config.redact)
+  return { state: { prompt: out.text }, counts: out.counts }
+}
+
+// ---- state the hooks keep ------------------------------------------------
+
+/** A short, stable key for a set of strings (two FNV-1a hashes and the length). */
+export function hashKey(...parts: string[]): string {
+  let a = 0x811c9dc5
+  let b = 0x01000193
+  let length = 0
+  for (const part of parts) {
+    const text = `${part}\u0000`
+    length += text.length
+    for (let i = 0; i < text.length; i++) {
+      const c = text.charCodeAt(i)
+      a = Math.imul(a ^ c, 0x01000193) >>> 0
+      b = Math.imul(b + c, 0x85ebca6b) >>> 0
+      b ^= b >>> 13
+    }
+  }
+  return `${length.toString(36)}-${a.toString(36)}${b.toString(36)}`
+}
+
+/** Decisions by request key, so two identical spawns cost one call. Successes only. */
+export function createDecisionCache(max = 200): {
+  get(key: string): Decision | undefined
+  set(key: string, decision: Decision): void
+  size(): number
+} {
+  const entries = new Map<string, Decision>()
+  return {
+    get: (key) => entries.get(key),
+    set(key, decision) {
+      entries.delete(key)
+      entries.set(key, decision)
+      while (entries.size > max) {
+        const oldest = entries.keys().next().value
+        if (oldest === undefined) break
+        entries.delete(oldest)
+      }
+    },
+    size: () => entries.size,
+  }
+}
+
+/**
+ * Stops calling a backend that keeps failing, so a dead one costs the
+ * timeout three times and not on every spawn. A rejected key (`fatal`) waits
+ * far longer than a slow network.
+ */
+export function createBreaker(
+  threshold = 3,
+  cooldownMs = 30_000,
+  fatalCooldownMs = 300_000,
+): {
+  allow(now: number): boolean
+  success(): void
+  failure(now: number, fatal?: boolean): void
+} {
+  let failures = 0
+  let openUntil = 0
+  return {
+    allow: (now) => now >= openUntil,
+    success() {
+      failures = 0
+      openUntil = 0
+    },
+    failure(now, fatal = false) {
+      failures += 1
+      if (fatal) openUntil = now + fatalCooldownMs
+      else if (failures >= threshold) openUntil = now + cooldownMs
+    },
+  }
+}
+
+/** Failure classes the user is told about once, however often they recur. */
+const ONCE_CLASSES = new Set(['no-key', 'config', 'override'])
+const ESCALATE_AT = new Set([1, 5, 25, 100, 500, 2000])
+
+/**
+ * Decides when a failure is shown: the first of each class, then at 5, 25,
+ * 100 and so on, so a dead backend is loud at the start and keeps a count
+ * without a toast on every spawn.
+ */
+export function createNotifier(): { report(kind: string): { count: number; show: boolean } } {
+  const counts = new Map<string, number>()
+  return {
+    report(kind) {
+      const count = (counts.get(kind) ?? 0) + 1
+      counts.set(kind, count)
+      return { count, show: ONCE_CLASSES.has(kind) ? count === 1 : ESCALATE_AT.has(count) }
+    },
+  }
+}
+
+/** The failure class of a non-2xx status. */
+export function classifyStatus(status: number): { kind: string; fatal: boolean } {
+  if (status === 401 || status === 403) return { kind: 'auth', fatal: true }
+  if (status === 429) return { kind: 'rate-limit', fatal: false }
+  if (status >= 500) return { kind: 'server', fatal: false }
+  return { kind: 'http', fatal: false }
+}
+
+/** The line shown to the person when Jev could not decide. */
+export function describeFailure(
+  kind: string,
+  count: number,
+  config: { policy: PolicyConfig; timeoutMs: number },
+  scope: 'subagent' | 'main' = 'subagent',
+): string {
+  const fb = `${config.policy.fallbackModel}/${config.policy.fallbackEffort}`
+  const what: Record<string, string> = {
+    timeout: `Jev did not answer within ${config.timeoutMs}ms`,
+    auth: 'Jev rejected the API key (401/403)',
+    'rate-limit': 'Jev is rate limiting (429)',
+    server: 'Jev returned a server error (5xx)',
+    http: 'Jev returned an HTTP error',
+    malformed: 'Jev returned an answer the router could not read',
+    network: 'the request to Jev failed',
+    'circuit-open': 'Jev calls are paused after repeated failures',
+    'no-key': 'no TypeSafe or Gateway API key is set for the chosen provider',
+    classifier: 'the built-in classifier gave no usable answer',
+    config: 'the router was configured with invalid options',
+    override: 'the session forces the subagent model, so the router cannot choose it',
+  }
+  const times = count > 1 ? ` (${count} so far)` : ''
+  if (kind === 'config' || kind === 'override') return `[jev-model-router] ${what[kind] ?? kind}${times}`
+  const outcome = scope === 'main' ? 'the main loop runs unchanged' : `subagents run on the fallback ${fb}`
+  return `[jev-model-router] ${what[kind] ?? kind}${times}: ${outcome}`
+}
+
+/**
+ * Efforts waiting for their subagent, and bound to it once it has an id.
+ *
+ * `turn.step` carries the agent's id, and `agent.spawn`'s `next` settles with
+ * it, but a subagent's `turn.start` is raised before that, and nothing orders
+ * its first step against the spawn's return. So the effort is filed under the
+ * prompt first (`turn.start` of the agent carries that prompt and its id),
+ * and under the id too once `next` returns, whichever comes first.
+ */
+export function createEffortPlans(max = 256): {
+  expect(promptKey: string, effort: Effort): void
+  cancel(promptKey: string, effort: Effort): void
+  bind(agentId: string, promptKey: string, effort: Effort): void
+  claim(agentId: string, promptKey: string): void
+  effortOf(agentId: string): Effort | undefined
+  release(agentId: string): void
+  size(): number
+} {
+  const byAgent = new Map<string, Effort>()
+  const waiting = new Map<string, Effort[]>()
+  const trim = () => {
+    while (byAgent.size > max) {
+      const oldest = byAgent.keys().next().value
+      if (oldest === undefined) break
+      byAgent.delete(oldest)
+    }
+    while (waiting.size > max) {
+      const oldest = waiting.keys().next().value
+      if (oldest === undefined) break
+      waiting.delete(oldest)
+    }
+  }
+  const take = (promptKey: string, effort?: Effort): Effort | undefined => {
+    const queue = waiting.get(promptKey)
+    if (!queue || queue.length === 0) return undefined
+    const index = effort === undefined ? 0 : queue.indexOf(effort)
+    if (index === -1) return undefined
+    const [taken] = queue.splice(index, 1)
+    if (queue.length === 0) waiting.delete(promptKey)
+    return taken
+  }
+  return {
+    expect(promptKey, effort) {
+      const queue = waiting.get(promptKey) ?? []
+      queue.push(effort)
+      waiting.set(promptKey, queue)
+      trim()
+    },
+    cancel(promptKey, effort) {
+      take(promptKey, effort)
+    },
+    bind(agentId, promptKey, effort) {
+      take(promptKey, effort)
+      if (!byAgent.has(agentId)) byAgent.set(agentId, effort)
+      trim()
+    },
+    claim(agentId, promptKey) {
+      if (byAgent.has(agentId)) return
+      const effort = take(promptKey)
+      if (effort !== undefined) byAgent.set(agentId, effort)
+      trim()
+    },
+    effortOf: (agentId) => byAgent.get(agentId),
+    release(agentId) {
+      byAgent.delete(agentId)
+    },
+    size: () => byAgent.size + waiting.size,
+  }
+}
+
+/**
+ * Main-loop decisions waiting for the turn that reads their prompt.
+ *
+ * A decision is tied to its prompt's TEXT, and claimed by the turn whose
+ * `turn.start` carries that text. Counting prompts (the earlier design) went
+ * out of step as soon as a prompt never started a turn: a command, a prompt a
+ * higher hook dropped, one merged into a queued turn. Identity cannot drift:
+ * a turn either finds its own prompt or runs unrouted.
+ */
+export function createPendingPrompts(max = 8): {
+  put(text: string, decision: Decision | null): void
+  claim(turnText: string): Decision | null
+  size(): number
+} {
+  let held: { text: string; decision: Decision | null }[] = []
+  return {
+    put(text, decision) {
+      held.push({ text: text.trim(), decision })
+      if (held.length > max) held = held.slice(held.length - max)
+    },
+    claim(turnText) {
+      const turn = turnText.trim()
+      if (!turn) return null
+      let chosen = -1
+      for (let i = held.length - 1; i >= 0; i--) {
+        if ((held[i] as { text: string }).text === turn) {
+          chosen = i
+          break
+        }
+      }
+      if (chosen === -1) {
+        // The turn may carry the prompt among others (queued prompts merged).
+        // One containing match is a fit; several is a guess, and a guess is
+        // worse than not routing.
+        const inside = held
+          .map((h, i) => ({ h, i }))
+          .filter(({ h }) => h.text.length > 0 && turn.includes(h.text))
+        if (inside.length === 1) chosen = (inside[0] as { i: number }).i
+      }
+      if (chosen === -1) return null
+      const decision = (held[chosen] as { decision: Decision | null }).decision
+      held = held.slice(chosen + 1)
+      return decision
+    },
+    size: () => held.length,
+  }
+}
+
+const PLACEHOLDER_SHAPE = /^[[(<{]\s*(?:redacted|hidden|omitted|withheld|placeholder|script|prompt)\b[^\n]{0,100}[\])>}]$/i
+
+/**
+ * Spots the fixed placeholder a hidden-script workflow run gives every agent
+ * as its prompt. The string is not documented, so this reads its shape (a
+ * bracketed notice) and, failing that, its repetition: the same short prompt
+ * on three different agents of one run.
+ */
+export function createPlaceholderGuard(): {
+  isPlaceholder(workflow: { runId: string; agentIndex: number } | undefined, prompt: string): boolean
+} {
+  const known = new Set<string>()
+  const runs = new Map<string, Map<string, Set<number>>>()
+  return {
+    isPlaceholder(workflow, prompt) {
+      if (!workflow) return false
+      const text = prompt.trim()
+      if (!text || known.has(text)) return true
+      if (PLACEHOLDER_SHAPE.test(text)) {
+        known.add(text)
+        return true
+      }
+      if (text.length > 200) return false
+      let run = runs.get(workflow.runId)
+      if (!run) {
+        run = new Map()
+        runs.set(workflow.runId, run)
+        while (runs.size > 50) {
+          const oldest = runs.keys().next().value
+          if (oldest === undefined) break
+          runs.delete(oldest)
+        }
+      }
+      const seen = run.get(text) ?? new Set<number>()
+      seen.add(workflow.agentIndex)
+      run.set(text, seen)
+      if (run.size > 50) run.delete(run.keys().next().value as string)
+      if (seen.size >= 3) {
+        known.add(text)
+        return true
+      }
+      return false
+    },
+  }
+}
+
+/**
+ * Why a spawn is left alone, with no Jev call, or null to route it. A fork
+ * inherits its parent's model; a teammate's model is left out by the engine;
+ * a resume's content is pinned; a hidden-script workflow agent's prompt is a
+ * placeholder the decision model cannot read.
+ */
+export function skipReason(
+  spawn: {
+    fork?: boolean
+    isTeammate?: true
+    resume?: unknown
+    workflow?: { runId: string; agentIndex: number }
+    prompt: string
+  },
+  guard: ReturnType<typeof createPlaceholderGuard>,
+): string | null {
+  if (spawn.resume) return 'a resumed agent'
+  if (spawn.fork) return 'a fork (inherits its parent)'
+  if (spawn.isTeammate) return 'a teammate'
+  if (guard.isPlaceholder(spawn.workflow, spawn.prompt)) return 'a workflow agent whose prompt is hidden'
+  return null
 }
 
 /**
  * Whether a prompt is a slash command and nothing else (`/simplify`). The
- * decision model sees only the name, never the skill or command it runs:
- * measured on TypeSafe (three calls each), `/simplify`, `/run` and `/github`
- * came back fast with effort 0.1 to 0.5, low effort for a multi-step skill,
- * while `/code-review` and `/security-review` came back balanced and deep.
- * With text after the name there is a task to read, and it is classified.
- * A one-segment path alone (`/etc`) matches too; nobody sends one as a task.
+ * decision model sees only the name, never the skill or command it runs.
  */
 export function bareCommand(text: string): boolean {
   return /^\/[^\s/]+$/.test(text.trim())
 }
 
-/**
- * Holds a prompt's classification until the turn that reads that prompt
- * starts.
- *
- * Nothing ties a decision to the turn it belongs to. Prompts can be queued
- * while the model is busy, a peer session's message can be delivered inside a
- * running turn, and `prompt.submit` carries no turn id at all while the
- * session is idle. So when more than one prompt is waiting, `take` reports
- * none: running a turn on another prompt's decision is a worse outcome than
- * not routing it, and not routing is what every other failure path here does.
- */
-export function pendingDecisions(): {
-  put(decision: Decision | null): void
-  take(): Decision | null
-} {
-  let held: Decision | null = null
-  let waiting = 0
-
-  return {
-    put(decision) {
-      waiting += 1
-      // Past the first, which prompt a turn will read is unknowable, so the
-      // slot is emptied instead of holding a decision that may not fit.
-      held = waiting === 1 ? decision : null
-    },
-    take() {
-      const decision = waiting === 1 ? held : null
-      held = null
-      waiting = 0
-      return decision
-    },
-  }
+/** Whether a prompt came from the person (their own Enter, a bridge, the SDK host). */
+export function fromPerson(origin: { kind: string } | undefined): boolean {
+  return origin?.kind === 'composer' || origin?.kind === 'bridge' || origin?.kind === 'sdk'
 }
+
+// ---- describing ----------------------------------------------------------
 
 /** A number for the log, or `n/d` when the backend reported none. */
 function reported(value: number | null): string {
@@ -454,39 +1023,26 @@ function reported(value: number | null): string {
 
 /**
  * The one-time line that says the router is alive, which backend answers it,
- * and which of the three switches are on.
- *
- * Without this, a router that loaded and a router that never loaded are told
- * apart only by the absence of later lines, which is not evidence of anything.
+ * and what it routes.
  */
-export function describeSetup(
-  provider: Provider | null,
-  url: string,
-  switches: { subagentModel: boolean; mainEffort: boolean; mainModel: boolean },
-  // `provider: "builtin"` is a choice, not a missing key. Reporting it as a
-  // credential problem sends someone hunting for a key they meant to omit.
-  builtinByChoice = false,
-): string {
-  const backend = provider
-    ? `${provider} (${url})`
-    : builtinByChoice
-      ? 'the built-in classifier, by choice'
-      : 'the built-in classifier, no key set'
+export function describeSetup(config: RouterConfig): string {
+  const backend =
+    config.mode === 'jev'
+      ? `${config.provider} (${config.url})`
+      : config.mode === 'builtin'
+        ? 'the built-in classifier, by choice'
+        : `no key: subagents run on the fallback ${config.policy.fallbackModel}/${config.policy.fallbackEffort}`
   const on = [
-    switches.subagentModel && 'subagent model',
-    switches.mainEffort && 'main effort',
-    switches.mainModel && 'main model',
+    config.routeSubagentModel && 'subagent model',
+    config.routeSubagentEffort && 'subagent effort',
+    config.routeMainEffort && 'main effort',
+    config.routeMainModel && 'main model',
   ].filter(Boolean)
-  return `ready on ${backend}; routing ${on.length > 0 ? on.join(', ') : 'nothing, every switch is off'}`
+  const privacy = config.mode === 'jev' ? `; redaction ${config.redactSensitive ? 'on' : 'OFF'}` : ''
+  return `ready on ${backend}; routing ${on.length > 0 ? on.join(', ') : 'nothing, every switch is off'}${privacy}`
 }
 
-/**
- * What the decision model answered, before any policy touches it: the raw
- * tier, effort and risk with their confidences, and how long it took.
- *
- * This is the line that shows the classification happened at all, separately
- * from whether the policy then decided to act on it.
- */
+/** What the decision model answered, before any policy touches it. */
 export function describeDecision(decision: Decision | null, ms: number | null): string {
   const took = ms === null ? '' : ` · ${Math.round(ms)}ms`
   if (!decision) return `no answer${took}`
@@ -501,10 +1057,7 @@ export function describeDecision(decision: Decision | null, ms: number | null): 
   return parts.join(' · ') + took
 }
 
-/**
- * The persistent status line: the last thing the router did, short enough to
- * sit on screen beside the engine's own notices.
- */
+/** The persistent status line: the last thing the router did. */
 export function describeStatus(
   decision: Decision | null,
   change: { model?: string; effort?: Effort } | null,

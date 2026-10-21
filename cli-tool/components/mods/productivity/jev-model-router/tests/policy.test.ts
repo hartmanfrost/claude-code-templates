@@ -5,14 +5,10 @@ import {
   endpoint,
   questions,
   describeDecision,
-  describeSetup,
   describeStatus,
-  pendingDecisions,
-  rankOf,
   readDecision,
   requestBody,
   requestHeaders,
-  requestModelId,
   route,
   selectProvider,
   bareCommand,
@@ -23,6 +19,8 @@ const config: PolicyConfig = {
   tiers: { fast: 'haiku', balanced: 'sonnet', deep: 'opus' },
   minUpgradeConfidence: 0.3,
   minDowngradeConfidence: 0.6,
+  fallbackModel: 'opus',
+  fallbackEffort: 'medium',
 }
 
 const gatewayAnswer = (
@@ -126,13 +124,6 @@ test('without a confidence a change may only go up, never down', () => {
 
   const up = readDecision(JSON.stringify({ answers: { tier: { type: 'choice', choice: 'deep' } } }))
   expect(route(up, on('claude-haiku-4-5-20251001'), config).model).toBe('opus')
-})
-
-test('an unrecognised model id is treated as an upgrade, not guessed at', () => {
-  expect(rankOf('some-other-vendor-model', config.tiers)).toBeNull()
-  const decision = readDecision(gatewayAnswer('fast', { fast: 0.35, balanced: 0.4, deep: 0.25 }))
-  // 0.35 clears the upgrade bar only; an undecidable direction gets that one.
-  expect(route(decision, on('some-other-vendor-model'), config).model).toBe('haiku')
 })
 
 test('the Gateway request carries the model id and spec version it matches on', () => {
@@ -247,53 +238,6 @@ test('max ranks above every rung the rubric can produce', () => {
   expect(route(sure, on('claude-sonnet-5', 'max'), config).effort).toBe('low')
 })
 
-// A prompt classified while another one is still waiting: the turn that
-// starts next cannot be tied to either, so neither decision is applied.
-const deepDecision: Decision = {
-  tier: 'deep',
-  confidence: 0.99,
-  risky: null,
-  effort: null,
-  effortConfidence: null,
-}
-const fastDecision: Decision = { ...deepDecision, tier: 'fast' }
-
-test('a decision is handed to the turn that follows its prompt', () => {
-  const pending = pendingDecisions()
-  pending.put(deepDecision)
-  expect(pending.take()).toEqual(deepDecision)
-})
-
-test('two prompts waiting at once yield no decision instead of the wrong one', () => {
-  const pending = pendingDecisions()
-  pending.put(fastDecision)
-  pending.put(deepDecision)
-  expect(pending.take()).toBeNull()
-})
-
-test('a prompt that failed to classify still shields the next prompt', () => {
-  const pending = pendingDecisions()
-  pending.put(null)
-  pending.put(deepDecision)
-  expect(pending.take()).toBeNull()
-})
-
-test('the slot empties on take, so a later turn never reuses a decision', () => {
-  const pending = pendingDecisions()
-  pending.put(deepDecision)
-  pending.take()
-  expect(pending.take()).toBeNull()
-})
-
-test('the slot recovers after an ambiguous round', () => {
-  const pending = pendingDecisions()
-  pending.put(fastDecision)
-  pending.put(deepDecision)
-  expect(pending.take()).toBeNull()
-  pending.put(deepDecision)
-  expect(pending.take()).toEqual(deepDecision)
-})
-
 // A turn the router leaves alone still has to say so: a silent no-op and a mod
 // that never loaded look identical in the transcript otherwise.
 test('a no-change decision reports what it wanted and what it kept', () => {
@@ -326,34 +270,6 @@ test('no classification at all is its own reason, not a no-change', () => {
   expect(route(null, { model: 'sonnet', effort: 'medium' }, config).reason).toBe('no decision')
 })
 
-// The transcript is the only place a mod's work is visible, so the lines it
-// writes are a contract, not decoration.
-test('the setup line names the backend and which switches are on', () => {
-  expect(
-    describeSetup('typesafe', 'https://api.typesafe.ai/v1/systemone', {
-      subagentModel: true,
-      mainEffort: true,
-      mainModel: false,
-    }),
-  ).toBe(
-    'ready on typesafe (https://api.typesafe.ai/v1/systemone); routing subagent model, main effort',
-  )
-})
-
-test('the setup line says so when there is no backend and when nothing routes', () => {
-  expect(
-    describeSetup(null, '', { subagentModel: false, mainEffort: false, mainModel: false }),
-  ).toBe('ready on the built-in classifier, no key set; routing nothing, every switch is off')
-})
-
-// `provider: "builtin"` is a deliberate choice; reporting it as a missing key
-// sends someone looking for a credential they meant to leave out.
-test('choosing the built-in classifier is not reported as a missing key', () => {
-  expect(
-    describeSetup(null, '', { subagentModel: true, mainEffort: true, mainModel: false }, true),
-  ).toBe('ready on the built-in classifier, by choice; routing subagent model, main effort')
-})
-
 test('the decision line carries every answer and the latency', () => {
   const decision = readDecision(gatewayAnswer('deep', { deep: 0.95 }, 0.01, 2.8))
   expect(describeDecision(decision, 249.4)).toBe(
@@ -372,20 +288,6 @@ test('the status line distinguishes a change from a deliberate no-change', () =>
   )
   expect(describeStatus(decision, null)).toBe('jev · fast 0.87 · unchanged')
   expect(describeStatus(null, null)).toBe('jev · no answer')
-})
-
-// `turn.step`'s `model` goes to the API as written, so a family alias has to
-// become an id there; the engine refuses "haiku" on a request.
-test('a family alias resolves to a full id for the main loop', () => {
-  expect(requestModelId('haiku')).toBe('claude-haiku-4-5-20251001')
-  expect(requestModelId('Sonnet')).toBe('claude-sonnet-5')
-  expect(requestModelId('opus')).toBe('claude-opus-5')
-})
-
-test('a full id or an unknown name is passed through unchanged', () => {
-  expect(requestModelId('claude-haiku-4-5-20251001')).toBe('claude-haiku-4-5-20251001')
-  expect(requestModelId('claude-opus-5[1m]')).toBe('claude-opus-5[1m]')
-  expect(requestModelId('my-org/custom')).toBe('my-org/custom')
 })
 
 // Staying in the same tier is not a change, so a session on `claude-opus-5[1m]`
