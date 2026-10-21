@@ -34,6 +34,7 @@ function world(on: any, reply: (url: string) => { status: number; text: string }
     classifies: 0,
     toasts: [] as string[],
     logs: [] as string[],
+    debugLogs: [] as string[],
     statuses: [] as (string | undefined)[],
     spawned: [] as { model?: string; prompt: string }[],
     steps: [] as { agentId?: string; effort?: unknown }[],
@@ -49,7 +50,7 @@ function world(on: any, reply: (url: string) => { status: number; text: string }
     return { value: 'fast' }
   })
   on('ui.toast', async ($: any, e: any) => (w.toasts.push(e.text), { value: undefined }))
-  on('ui.log', async ($: any, e: any) => (w.logs.push(e.text), { value: undefined }))
+  on('ui.log', async ($: any, e: any) => (w.logs.push(e.text), e.to === 'debug' && w.debugLogs.push(e.text), { value: undefined }))
   on('ui.status', async ($: any, e: any) => (w.statuses.push(e.text), { value: undefined }))
   let n = 0
   on('agent.spawn', async ($: any, e: any) => {
@@ -169,11 +170,54 @@ test('resumes, forks and teammates make no call and are left alone', { options: 
   expect(w.spawned[0]?.model).toBe('haiku')
 })
 
-test('a hidden-script workflow placeholder prompt makes no call', { options: { typesafeApiKey: KEY } }, async ($, on) => {
+const MARKER = '(withheld: this workflow run does not share its script)'
+
+test('a withheld-script placeholder makes no call, gets the fallback, and is shown', { options: { typesafeApiKey: KEY } }, async ($, on) => {
   const w = world(on)
   mock.clock(on)
-  await $.agent.spawn(spawnInput({ prompt: '[prompt hidden]', workflow: { runId: 'wf_1', agentIndex: 1 } }))
+  for (let i = 1; i <= 3; i++) {
+    await $.agent.spawn(spawnInput({ prompt: MARKER, workflow: { runId: 'wf_1', agentIndex: i }, model: 'haiku' }))
+  }
   expect(w.fetches.length).toBe(0)
+  expect(w.spawned.every((s) => s.model === 'opus')).toBe(true)
+  // Loud, but rate-limited: one toast and one transcript line for the first.
+  expect(w.toasts.filter((t) => t.includes('withheld prompt')).length).toBe(1)
+  expect(w.logs.filter((t) => t.includes('withheld prompt') && !t.includes('jev (')).length).toBe(1)
+  expect(w.statuses.some((t) => typeof t === 'string' && t.includes('fallback ×3'))).toBe(true)
+  await step($, 'ag3', 'low')
+  expect(w.steps.at(-1)?.effort).toBe('medium')
+})
+
+test('3+ identical prompts in one workflow run are all routed, with one Jev call', { options: { typesafeApiKey: KEY } }, async ($, on) => {
+  const w = world(on)
+  mock.clock(on)
+  const prompt = 'Reply with the single word PONG.'
+  await Promise.all(
+    [1, 2, 3, 4, 5].map((i) => $.agent.spawn(spawnInput({ prompt, description: 'pong', workflow: { runId: 'wf_7', agentIndex: i }, model: 'sonnet' }))),
+  )
+  expect(w.fetches.length).toBe(1)
+  expect(w.spawned.length).toBe(5)
+  expect(w.spawned.every((s) => s.model === 'haiku')).toBe(true)
+  expect(w.toasts.length).toBe(0)
+  // And sequentially, from the cache.
+  await $.agent.spawn(spawnInput({ prompt, description: 'pong', workflow: { runId: 'wf_7', agentIndex: 6 } }))
+  expect(w.fetches.length).toBe(1)
+  expect(w.spawned.at(-1)?.model).toBe('haiku')
+})
+
+test('forks, teammates and resumes are logged once per kind at normal level', { options: { typesafeApiKey: KEY } }, async ($, on) => {
+  const w = world(on)
+  mock.clock(on)
+  for (let i = 0; i < 3; i++) {
+    await $.agent.spawn(spawnInput({ fork: true }))
+    await $.agent.spawn(spawnInput({ isTeammate: true, name: `t${i}` }))
+    await $.agent.spawn(spawnInput({ resume: { agentId: 'old' } }))
+  }
+  expect(w.fetches.length).toBe(0)
+  for (const kind of ['a fork', 'a teammate', 'a resumed agent']) {
+    expect(w.logs.filter((t) => t.includes(kind) && t.includes('left as it is')).length).toBe(1)
+  }
+  expect(w.debugLogs.filter((t) => t.includes('left as it is')).length).toBe(0)
 })
 
 test('a secret in the prompt never reaches the network', { options: { typesafeApiKey: KEY } }, async ($, on) => {

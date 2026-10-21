@@ -30,7 +30,7 @@ With both main-loop switches off, the `prompt.submit` hook returns immediately: 
 
 ### How a subagent gets its model and effort
 
-1. `agent.spawn` fires. Forks, teammates, resumes and hidden-script workflow agents are skipped with no call (see [Limitations](#limitations)).
+1. `agent.spawn` fires. Forks, teammates and resumes are skipped with no call; a workflow agent with a withheld prompt gets the fallback, loudly (see [Limitations](#limitations)).
 2. The router redacts and truncates the subagent's prompt, description and type (see [Privacy](#privacy)), and asks Jev. Two identical spawns in a session cost one call (a decision cache keyed by a hash of type, description and prompt).
 3. The decision is measured against the **fallback** (`fallbackModel`/`fallbackEffort`, default `opus`/`medium`), the configured default. It applies in both directions: a task Jev reads as mechanical goes below the fallback, one it reads as hard goes above. The bars differ because the mistakes do:
    - spending **more** than the fallback needs `minUpgradeConfidence` (0.3);
@@ -110,7 +110,7 @@ Linear time: built-in detectors use literal prefixes and bounded, non-overlappin
 
 ## Limitations
 
-- **Hidden-script workflow agents.** Some Workflow runs keep their script out of hooks and give every agent a fixed placeholder as its prompt. Its text is not documented, so the router recognises a bracketed notice (`[script hidden]`) and, failing that, the same short prompt on three different agents of one run. The first one or two such agents may still be classified on the placeholder. A skipped agent is left exactly as the script defined it.
+- **Hidden-script workflow agents.** Some Workflow runs keep their script out of hooks and give every agent the fixed prompt `(withheld: this workflow run does not share its script)`. Jev cannot read the task, so such an agent runs on the fallback model and effort and the router reports it. Only that text counts; a repeated or short prompt is routed normally.
 - **Skipped spawns, no call, no change:** forks (they inherit the parent), teammates (the engine ignores a model rewrite for them), resumed agents (their content is pinned), and spawns the router recognises as placeholders. A **resumed agent runs at the default effort**: its entry was dropped when it first ended.
 - **Effort on a model without effort.** If a request carries no effort, none is written onto it. All three families reported one in testing.
 - **Effort is checked, not guaranteed.** `effort` is rewritable per the declarations and the rewritten value was seen on the request; whether the model honours `xhigh` the way it does `high` is the API's concern.
@@ -118,6 +118,11 @@ Linear time: built-in detectors use literal prefixes and bounded, non-overlappin
 - **Timeouts do not cancel the request** (no abort signal on `$.http.fetch`); a late answer is dropped.
 - **Toasts** only exist in an interactive terminal; `claude -p` and the SDK get the transcript line and the debug log.
 - **Main-loop routing**, if switched on, is fail-open: on any failure the turn runs unchanged (it has no fallback to apply), and the failure is shown the same way.
+
+## What changed in 0.5.0-hartmanfrost.4
+
+- **Identical prompts are never skipped.** The "same short prompt on three agents of one run" heuristic is gone: a fan-out of N verifiers with one prompt is N real tasks, all routed, and identical concurrent spawns share one Jev call (in-flight dedup plus the decision cache). A hidden-script placeholder is recognised only by its literal text, `(withheld: this workflow run does not share its script)` (Claude Code 2.1.305/2.1.306 spawn site).
+- **A withheld prompt is no longer a silent skip.** The agent runs on `fallbackModel`/`fallbackEffort` and the router says so (toast + transcript line, rate-limited like other failures). Forks, teammates and resumes stay unrouted but are now logged once per session per kind at normal level, not debug.
 
 ## What changed in 0.5.0-hartmanfrost.3
 
@@ -150,7 +155,7 @@ Fixes from review of `.1`:
 - Loud failure with `fallbackModel`/`fallbackEffort`, toast plus transcript, escalating counts, a circuit breaker; keyless mode uses the fallback and one notice instead of `$.model.classify`.
 - Ranks, not strings: a forced-risk decision no longer rewrites `claude-opus-5-5[1m]` to `opus` (the `[1m]` suffix is never stripped); a model the router cannot place (`fable`) is never touched.
 - `pendingDecisions` slot desync fixed: main-loop decisions are tied to the prompt's text and claimed at `turn.start`, not counted.
-- Skips resumes, forks, teammates, placeholder prompts and non-person prompts (`isMeta`, commands, notifications, peers, schedules).
+- Skips resumes, forks, teammates and non-person prompts (`isMeta`, commands, notifications, peers, schedules).
 - https-only base URLs (loopback excepted), option range validation with visible warnings, classifier-label validation, decision cache, `maxPromptChars`.
 - New: secret redaction before anything is sent.
 - Alias ids for the main loop updated to the ids Claude Code 2.1.305 reports (`claude-haiku-5-5`, `claude-sonnet-5-5`, `claude-opus-5-5`).

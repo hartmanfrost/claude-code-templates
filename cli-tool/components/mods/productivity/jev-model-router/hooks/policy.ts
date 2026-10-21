@@ -805,6 +805,7 @@ export function describeFailure(
     malformed: 'Jev returned an answer the router could not read',
     network: 'the request to Jev failed',
     'circuit-open': 'Jev calls are paused after repeated failures',
+    placeholder: 'a workflow agent got a withheld prompt (its run keeps the script private), so Jev cannot read the task',
     'no-key': 'no TypeSafe or Gateway API key is set for the chosen provider',
     classifier: 'the built-in classifier gave no usable answer',
     config: 'the router was configured with invalid options',
@@ -972,72 +973,52 @@ export function createPendingPrompts(max = 8): {
   }
 }
 
-const PLACEHOLDER_SHAPE = /^[[(<{]\s*(?:redacted|hidden|omitted|withheld|placeholder|script|prompt)\b[^\n]{0,100}[\])>}]$/i
-
 /**
- * Spots the fixed placeholder a hidden-script workflow run gives every agent
- * as its prompt. The string is not documented, so this reads its shape (a
- * bracketed notice) and, failing that, its repetition: the same short prompt
- * on three different agents of one run.
+ * The prompt Claude Code 2.1.305 gives a workflow agent on a run that keeps its
+ * script out of SDK events: the literal string
+ * `(withheld: this workflow run does not share its script)`, found in the
+ * binary at the spawn site (`prompt: <hidden> ? "(withheld: ...)" : script
+ * prompt`). It is matched exactly (after trimming), plus the same
+ * parenthesised `withheld:` notice naming the script, so a reworded future
+ * release still matches. A prompt is never read as a placeholder because it
+ * is short, repeated or empty: N agents with one prompt are N real tasks.
  */
-export function createPlaceholderGuard(): {
-  isPlaceholder(workflow: { runId: string; agentIndex: number } | undefined, prompt: string): boolean
-} {
-  const known = new Set<string>()
-  const runs = new Map<string, Map<string, Set<number>>>()
-  return {
-    isPlaceholder(workflow, prompt) {
-      if (!workflow) return false
-      const text = prompt.trim()
-      if (!text || known.has(text)) return true
-      if (PLACEHOLDER_SHAPE.test(text)) {
-        known.add(text)
-        return true
-      }
-      if (text.length > 200) return false
-      let run = runs.get(workflow.runId)
-      if (!run) {
-        run = new Map()
-        runs.set(workflow.runId, run)
-        while (runs.size > 50) {
-          const oldest = runs.keys().next().value
-          if (oldest === undefined) break
-          runs.delete(oldest)
-        }
-      }
-      const seen = run.get(text) ?? new Set<number>()
-      seen.add(workflow.agentIndex)
-      run.set(text, seen)
-      if (run.size > 50) run.delete(run.keys().next().value as string)
-      if (seen.size >= 3) {
-        known.add(text)
-        return true
-      }
-      return false
-    },
-  }
+const PLACEHOLDER_EXACT = '(withheld: this workflow run does not share its script)'
+const PLACEHOLDER_SHAPE = /^\(withheld:[^()\n]{0,120}\bscript\b[^()\n]{0,60}\)$/i
+
+/** Whether a workflow agent's prompt is the fixed hidden-script placeholder. */
+export function isHiddenScriptPlaceholder(workflow: unknown, prompt: string): boolean {
+  if (!workflow) return false
+  const text = prompt.trim()
+  return text === PLACEHOLDER_EXACT || PLACEHOLDER_SHAPE.test(text)
+}
+
+/** Why a spawn is not routed, and of which kind. */
+export interface Skip {
+  kind: 'resume' | 'fork' | 'teammate' | 'placeholder'
+  reason: string
 }
 
 /**
- * Why a spawn is left alone, with no Jev call, or null to route it. A fork
- * inherits its parent's model; a teammate's model is left out by the engine;
- * a resume's content is pinned; a hidden-script workflow agent's prompt is a
- * placeholder the decision model cannot read.
+ * Why a spawn gets no Jev call, or null to route it. A fork inherits its
+ * parent's model; a teammate's model is left out by the engine; a resume's
+ * content is pinned (these three are legitimately unroutable); a hidden-script
+ * workflow agent's prompt is a placeholder the decision model cannot read (the
+ * caller applies the fallback and says so).
  */
-export function skipReason(
-  spawn: {
-    fork?: boolean
-    isTeammate?: true
-    resume?: unknown
-    workflow?: { runId: string; agentIndex: number }
-    prompt: string
-  },
-  guard: ReturnType<typeof createPlaceholderGuard>,
-): string | null {
-  if (spawn.resume) return 'a resumed agent'
-  if (spawn.fork) return 'a fork (inherits its parent)'
-  if (spawn.isTeammate) return 'a teammate'
-  if (guard.isPlaceholder(spawn.workflow, spawn.prompt)) return 'a workflow agent whose prompt is hidden'
+export function skipReason(spawn: {
+  fork?: boolean
+  isTeammate?: true
+  resume?: unknown
+  workflow?: { runId: string; agentIndex: number }
+  prompt: string
+}): Skip | null {
+  if (spawn.resume) return { kind: 'resume', reason: 'a resumed agent' }
+  if (spawn.fork) return { kind: 'fork', reason: 'a fork (inherits its parent)' }
+  if (spawn.isTeammate) return { kind: 'teammate', reason: 'a teammate' }
+  if (isHiddenScriptPlaceholder(spawn.workflow, spawn.prompt)) {
+    return { kind: 'placeholder', reason: 'a workflow agent whose prompt the run withholds' }
+  }
   return null
 }
 

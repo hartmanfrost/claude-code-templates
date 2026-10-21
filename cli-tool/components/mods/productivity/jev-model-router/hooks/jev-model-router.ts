@@ -41,7 +41,6 @@ import {
   createEffortPlans,
   createNotifier,
   createPendingPrompts,
-  createPlaceholderGuard,
   describeDecision,
   describeFailure,
   describeSetup,
@@ -183,7 +182,8 @@ export const register: Register = (on, options) => {
   const cache = createDecisionCache()
   const notifier = createNotifier()
   const plans = createEffortPlans()
-  const guard = createPlaceholderGuard()
+  const inflight = new Map<string, Promise<Outcome>>()
+  const unroutable = new Set<string>()
   const pending = createPendingPrompts()
   // Main-loop bookkeeping, per turn, dropped at turn.complete.
   const claimed = new Map<string, Decision | null>()
@@ -328,43 +328,60 @@ export const register: Register = (on, options) => {
       return result
     }
 
-    // Forks, teammates, resumes and hidden-script workflow agents: no call.
-    const skip = skipReason(e, guard)
-    if (skip) {
-      if (config.logDecisions) {
-        $.ui.log(`[jev-model-router] ${e.subagentType}: left alone, ${skip}`, { to: 'debug' })
+    // Forks, teammates and resumes are legitimately unroutable: left as they
+    // are, said once per session per kind (not debug-only). A withheld prompt
+    // is a failure to route: the fallback applies and it is reported below.
+    const skip = skipReason(e)
+    if (skip && skip.kind !== 'placeholder') {
+      if (!unroutable.has(skip.kind)) {
+        unroutable.add(skip.kind)
+        $.ui.log(`[jev-model-router] ${skip.reason}: left as it is (no Jev call; further ones of this kind are not logged)`)
       }
       return launch(e, null)
     }
 
     // 1. A decision: from the cache, from Jev, from the built-in classifier,
-    //    or none (and then why).
+    //    or none (and then why). Identical concurrent spawns share one call.
     const key = hashKey(e.subagentType, e.description, e.prompt)
     let decision: Decision | null = cache.get(key) ?? null
-    let failure: string | null = null
+    let failure: string | null = skip ? 'placeholder' : null
     let counts: RedactCounts = {}
     const startedAt = await $.clock.now()
     let cached = decision !== null
 
-    if (!decision) {
+    if (!decision && !skip) {
       if (config.mode === 'keyless') {
         failure = 'no-key'
       } else if (config.mode === 'jev' && !breaker.allow(startedAt)) {
         failure = 'circuit-open'
       } else {
-        const built = buildSubagentState(e, config)
-        counts = built.counts
-        const outcome =
-          config.mode === 'jev'
-            ? await askJev($, config, built.state)
-            : await askBuiltin($, built.state.prompt ?? '')
+        const waiting = inflight.get(key)
+        let outcome: Outcome
+        if (waiting) {
+          outcome = await waiting
+          cached = true
+        } else {
+          const built = buildSubagentState(e, config)
+          counts = built.counts
+          const call = (
+            config.mode === 'jev' ? askJev($, config, built.state) : askBuiltin($, built.state.prompt ?? '')
+          ).then((o) => {
+            if (config.mode === 'jev') {
+              if (o.failure) breaker.failure(startedAt, o.fatal)
+              else breaker.success()
+            }
+            if (o.decision) cache.set(key, o.decision)
+            return o
+          })
+          inflight.set(key, call)
+          try {
+            outcome = await call
+          } finally {
+            inflight.delete(key)
+          }
+        }
         decision = outcome.decision
         failure = outcome.failure
-        if (config.mode === 'jev') {
-          if (failure) breaker.failure(startedAt, outcome.fatal)
-          else breaker.success()
-        }
-        if (decision) cache.set(key, decision)
       }
     }
     cached = cached && decision !== null

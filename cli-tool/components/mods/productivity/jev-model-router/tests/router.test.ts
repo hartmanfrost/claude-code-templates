@@ -8,7 +8,7 @@ import {
   createEffortPlans,
   createNotifier,
   createPendingPrompts,
-  createPlaceholderGuard,
+  isHiddenScriptPlaceholder,
   describeFailure,
   describeSetup,
   fallbackRouting,
@@ -422,43 +422,48 @@ test('the pending list is bounded', () => {
 const normal = { prompt: 'Investigate the flaky test', fork: false }
 
 test('forks, teammates and resumes are skipped with no call', () => {
-  const guard = createPlaceholderGuard()
-  expect(skipReason({ ...normal, fork: true }, guard)).toContain('fork')
-  expect(skipReason({ ...normal, isTeammate: true }, guard)).toContain('teammate')
-  expect(skipReason({ ...normal, resume: { agentId: 'a' } }, guard)).toContain('resumed')
-  expect(skipReason(normal, guard)).toBeNull()
+  expect(skipReason({ ...normal, fork: true })?.kind).toBe('fork')
+  expect(skipReason({ ...normal, isTeammate: true })?.kind).toBe('teammate')
+  expect(skipReason({ ...normal, resume: { agentId: 'a' } })?.kind).toBe('resume')
+  expect(skipReason(normal)).toBeNull()
 })
 
 test('a workflow agent with a normal prompt is routed', () => {
-  const guard = createPlaceholderGuard()
-  expect(skipReason({ ...normal, workflow: { runId: 'wf_1', agentIndex: 1 } }, guard)).toBeNull()
+  expect(skipReason({ ...normal, workflow: { runId: 'wf_1', agentIndex: 1 } })).toBeNull()
 })
 
-test('a bracketed notice in place of a prompt is a placeholder', () => {
-  const guard = createPlaceholderGuard()
+const MARKER = '(withheld: this workflow run does not share its script)'
+
+test('the exact withheld-script marker is a placeholder, only inside a workflow', () => {
   const workflow = { runId: 'wf_1', agentIndex: 1 }
-  expect(skipReason({ prompt: '[script hidden]', fork: false, workflow }, guard)).toContain('hidden')
-  expect(skipReason({ prompt: '', fork: false, workflow }, guard)).toContain('hidden')
-  // Outside a workflow the same words are just a prompt.
-  expect(skipReason({ prompt: '[script hidden]', fork: false }, guard)).toBeNull()
+  expect(skipReason({ prompt: MARKER, fork: false, workflow })?.kind).toBe('placeholder')
+  expect(skipReason({ prompt: `  ${MARKER}\n`, fork: false, workflow })?.kind).toBe('placeholder')
+  expect(skipReason({ prompt: MARKER, fork: false })).toBeNull()
+  expect(isHiddenScriptPlaceholder(workflow, '(withheld: this run does not share its script)')).toBe(true)
 })
 
-test('the same short prompt on three agents of one run is read as a placeholder from then on', () => {
-  const guard = createPlaceholderGuard()
-  const prompt = 'Run the assigned step of the workflow.'
-  const of = (agentIndex: number) => ({ prompt, fork: false, workflow: { runId: 'wf_9', agentIndex } })
-  expect(skipReason(of(1), guard)).toBeNull()
-  expect(skipReason(of(2), guard)).toBeNull()
-  expect(skipReason(of(3), guard)).toContain('hidden')
-  expect(skipReason(of(4), guard)).toContain('hidden')
-  // Even in another run, once learned.
-  expect(skipReason({ prompt, fork: false, workflow: { runId: 'wf_10', agentIndex: 1 } }, guard)).toContain('hidden')
+test('ordinary prompts are never placeholders', () => {
+  const workflow = { runId: 'wf_1', agentIndex: 1 }
+  for (const prompt of [
+    '',
+    'Reply with the single word PONG.',
+    '[script hidden]',
+    '[prompt hidden]',
+    '[redacted]',
+    '(withheld)',
+    'Explain why (withheld: the script) is not shared',
+    `Note: ${MARKER}`,
+    'Run the assigned step of the workflow.',
+  ]) {
+    expect(isHiddenScriptPlaceholder(workflow, prompt)).toBe(false)
+    expect(skipReason({ prompt, fork: false, workflow })).toBeNull()
+  }
 })
 
-test('a retry of one agent does not count as three', () => {
-  const guard = createPlaceholderGuard()
-  const spawn = { prompt: 'same prompt', fork: false, workflow: { runId: 'wf_2', agentIndex: 1 } }
-  for (let i = 0; i < 5; i++) expect(skipReason(spawn, guard)).toBeNull()
+test('the same short prompt on any number of agents of one run is always routed', () => {
+  for (let i = 1; i <= 10; i++) {
+    expect(skipReason({ prompt: 'Reply with the single word PONG.', fork: false, workflow: { runId: 'wf_9', agentIndex: i } })).toBeNull()
+  }
 })
 
 test('only a person\'s own prompts are classified on the main loop', () => {
