@@ -242,8 +242,11 @@ async function heartbeat($: Dollar, sc: StatusCtx): Promise<void> {
 }
 
 /** Writes now if the active set changed, and keeps the heartbeat going while it is not empty. */
-async function publishStatus($: Dollar, sc: StatusCtx, changed: boolean): Promise<void> {
-  if (changed) await sc.coalesce(() => writeStatus($, sc))
+function publishStatus($: Dollar, sc: StatusCtx, changed: boolean): void {
+  // Fire and forget: the status line does not need the result, and a slow or
+  // hung fs.write must never hold up a subagent's turn or the Agent tool's
+  // result. writeStatus and the coalescer swallow their own failures.
+  if (changed) void sc.coalesce(() => writeStatus($, sc)).catch(() => {})
   if (sc.beating || sc.tracker.size() === 0) return
   sc.beating = true
   void heartbeat($, sc)
@@ -294,7 +297,7 @@ export const register: Register = (on, options) => {
       // The subagent's own turn: its text is the prompt it was spawned with,
       // and its id is what turn.step will carry.
       plans.claim(e.agentId, hashKey(e.text))
-      if (status.enabled) await publishStatus($, status, status.tracker.start(e.agentId, await $.clock.now()))
+      if (status.enabled) publishStatus($, status, status.tracker.start(e.agentId, await $.clock.now()))
     } else if (config.routeMainLoop) {
       claimed.set(e.turnId, pending.claim(e.text))
     }
@@ -304,7 +307,7 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     if (e.agentId) {
       plans.release(e.agentId)
-      if (status.enabled) await publishStatus($, status, status.tracker.complete(e.agentId))
+      if (status.enabled) publishStatus($, status, status.tracker.complete(e.agentId))
     } else {
       claimed.delete(e.turnId)
       mainPlans.delete(e.turnId)
@@ -361,7 +364,7 @@ export const register: Register = (on, options) => {
     // A subagent's step: its effort was decided at agent.spawn.
     if (e.agentId) {
       if (status.enabled && status.tracker.knows(e.agentId)) {
-        await publishStatus($, status, status.tracker.step(e.agentId, await $.clock.now()))
+        publishStatus($, status, status.tracker.step(e.agentId, await $.clock.now()))
       }
       const wanted = plans.effortOf(e.agentId)
       // A model without effort carries none to adjust.
@@ -430,7 +433,10 @@ export const register: Register = (on, options) => {
       // Only agents this router routed are counted in the status file.
       if (status.enabled && routing) {
         const meta = { model: familyOf(result.model ?? ev.model ?? ''), effort, fallback: routing.fallback }
-        await publishStatus($, status, status.tracker.bind(result.agentId, meta, boundAt))
+        publishStatus($, status, status.tracker.bind(result.agentId, meta, boundAt))
+      } else if (status.enabled) {
+        // A resume of an agent routed earlier: its effort plan is gone.
+        publishStatus($, status, status.tracker.resumed(result.agentId))
       }
       return result
     }

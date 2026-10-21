@@ -20,6 +20,8 @@ export const SCHEMA_VERSION = 1
 export const HEARTBEAT_MS = 5000
 /** An agent with no turn.start/turn.step for this long is no longer running. */
 export const IDLE_PRUNE_MS = 20 * 60 * 1000
+/** A running agent nobody bound within this long is unrouted (fork, teammate) and forgotten. */
+export const UNBOUND_GRACE_MS = 60 * 1000
 /** Routing metadata is forgotten after this long (a resume keeps it until then). */
 export const META_TTL_MS = 4 * 60 * 60 * 1000
 
@@ -49,7 +51,8 @@ export function statePath(configDir: string, sessionId: string): string {
 export function familyOf(model: string): string {
   const lowered = String(model).toLowerCase()
   for (const family of ['haiku', 'sonnet', 'opus']) if (lowered.includes(family)) return family
-  return lowered
+  // An empty id is never emitted: the reader would have nothing to show.
+  return lowered || 'unknown'
 }
 
 export function serialize(sessionId: string, now: number, active: ActiveAgent[]): string {
@@ -74,6 +77,12 @@ const DONE = new Set(['completed', 'failed', 'killed'])
 export interface Tracker {
   /** Records how an agent was routed (after `next()` returned its id). True if the active set changed. */
   bind(agentId: string, meta: AgentMeta, now: number): boolean
+  /**
+   * A resume spawn of an agent this router routed earlier: it runs on its old
+   * model, but its effort plan is gone (turn.complete released it), so the
+   * effort is no longer enforced and shows as unknown (null). True if the active set changed.
+   */
+  resumed(agentId: string): boolean
   /** The agent's loop started. True if the active set changed. */
   start(agentId: string, now: number): boolean
   /** The agent's loop ended, whatever the reason. True if the active set changed. */
@@ -95,14 +104,32 @@ export function createTracker(): Tracker {
   const running = new Map<string, { startedAt: number; lastSeen: number }>()
 
   const isActive = (id: string) => meta.has(id) && running.has(id)
+  let lastNow = 0
+
+  // Cheap housekeeping on every event, so nothing depends on the heartbeat
+  // (which only runs while a routed agent is active): unrouted agents that
+  // never got metadata, and metadata of agents long gone.
+  const sweep = (now: number) => {
+    lastNow = Math.max(lastNow, now)
+    for (const [id, r] of running) if (!meta.has(id) && now - r.startedAt > UNBOUND_GRACE_MS) running.delete(id)
+    for (const [id, m] of meta) if (!running.has(id) && now - m.boundAt > META_TTL_MS) meta.delete(id)
+  }
 
   return {
     bind(agentId, m, now) {
+      sweep(now)
       const was = isActive(agentId)
       meta.set(agentId, { ...m, boundAt: now })
       return !was && isActive(agentId)
     },
+    resumed(agentId) {
+      const m = meta.get(agentId)
+      if (!m || m.effort === null) return false
+      m.effort = null
+      return running.has(agentId)
+    },
     start(agentId, now) {
+      sweep(now)
       const was = isActive(agentId)
       running.set(agentId, { startedAt: now, lastSeen: now })
       return !was && isActive(agentId)
@@ -110,6 +137,7 @@ export function createTracker(): Tracker {
     complete(agentId) {
       const was = isActive(agentId)
       running.delete(agentId)
+      sweep(lastNow)
       return was
     },
     step(agentId, now) {
@@ -129,14 +157,16 @@ export function createTracker(): Tracker {
       let changed = false
       for (const [id, r] of [...running]) {
         const status = listed?.get(id)
-        if (now - r.lastSeen > IDLE_PRUNE_MS || (status !== undefined && DONE.has(status))) {
+        // An agent the engine lists as still going (running, or waiting on a
+        // background task) is alive however quiet it is: one long tool call
+        // emits no step. The idle prune is for agents the listing does not know.
+        const alive = status !== undefined && !DONE.has(status)
+        if ((!alive && now - r.lastSeen > IDLE_PRUNE_MS) || (status !== undefined && DONE.has(status))) {
           if (isActive(id)) changed = true
           running.delete(id)
         }
       }
-      for (const [id, m] of [...meta]) {
-        if (!running.has(id) && now - m.boundAt > META_TTL_MS) meta.delete(id)
-      }
+      sweep(now)
       return changed
     },
     reset() {

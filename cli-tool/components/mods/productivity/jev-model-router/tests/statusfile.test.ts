@@ -2,6 +2,7 @@ import { expect, mock, test } from 'claude-code/testing'
 import {
   HEARTBEAT_MS,
   IDLE_PRUNE_MS,
+  UNBOUND_GRACE_MS,
   META_TTL_MS,
   createCoalescer,
   createTracker,
@@ -14,6 +15,10 @@ import {
 const meta = (model = 'haiku', effort: string | null = 'low', fallback = false) => ({ model, effort, fallback })
 
 // ---- pure: tracker, serializer ------------------------------------------
+
+test('familyOf never returns an empty model', () => {
+  expect(familyOf('')).toBe('unknown')
+})
 
 test('familyOf matches by substring, keeps unknown ids raw', () => {
   expect(familyOf('claude-opus-5-5[1m]')).toBe('opus')
@@ -98,6 +103,47 @@ test('prune drops idle agents, finished ones from the listing, and old metadata'
   u.start('x', 0)
   expect(u.prune(10, new Map())).toBe(false)
   expect(u.prune(10, new Map([['x', 'running']]))).toBe(false)
+})
+
+test('a long-quiet agent that the engine lists as running or waiting is not idle-pruned', () => {
+  const t = createTracker()
+  for (const id of ['run', 'wait', 'unknown']) {
+    t.bind(id, meta(), 0)
+    t.start(id, 0)
+  }
+  const listed = new Map([['run', 'running'], ['wait', 'waiting']])
+  expect(t.prune(IDLE_PRUNE_MS * 3, listed)).toBe(true)
+  expect(t.active().map((a) => a.agentId).sort()).toEqual(['run', 'wait'])
+})
+
+test('a resume of a routed agent shows its effort as unknown, keeps model', () => {
+  const t = createTracker()
+  t.bind('a', meta('opus', 'high'), 0)
+  t.start('a', 1)
+  t.complete('a')
+  expect(t.resumed('a')).toBe(false) // not running yet: nothing visible changed
+  expect(t.start('a', 5)).toBe(true)
+  expect(t.active()[0]).toMatchObject({ model: 'opus', effort: null })
+  // resumed while already running reports the change
+  const u = createTracker()
+  u.bind('b', meta('opus', 'high'), 0)
+  u.start('b', 1)
+  expect(u.resumed('b')).toBe(true)
+  expect(u.resumed('b')).toBe(false)
+  expect(u.resumed('nobody')).toBe(false)
+})
+
+test('unrouted agents and old metadata are swept without any heartbeat', () => {
+  const t = createTracker()
+  t.start('fork', 0)
+  t.start('other', UNBOUND_GRACE_MS + 1) // any later event sweeps
+  expect(t.knows('fork')).toBe(false)
+  expect(t.knows('other')).toBe(true)
+  t.bind('r', meta(), 0)
+  t.start('r', 0)
+  t.complete('r')
+  t.start('late', META_TTL_MS + 1)
+  expect(t.knows('r')).toBe(false)
 })
 
 test('reset empties and reports a change only when there was one', () => {
@@ -190,10 +236,11 @@ function world(
   tiers: string[] = ['fast'],
   over: { fetch?: () => { status: number; text: string }; spawnModel?: string; agentId?: (n: number) => string; spawn?: (e: any, n: number) => Promise<void> } = {},
 ) {
-  const w = { writes: [] as { path: string; json: any }[], list: [] as { id: string; status: string }[] }
+  const w = { hang: false, writes: [] as { path: string; json: any }[], list: [] as { id: string; status: string }[] }
   on('env.get', ($: any, e: any) => ({ value: env[e.name] }))
   on('session.id', () => ({ value: 'sess-1' }))
   on('fs.write', ($: any, e: any) => {
+    if (w.hang) return new Promise(() => {}) as never
     w.writes.push({ path: e.path, json: JSON.parse(e.text) })
     return { value: undefined }
   })
@@ -227,18 +274,22 @@ function world(
 
 const start = (id: string) => ({ turnId: 'tt-' + id, text: 'x', agentId: id }) as any
 const done = (id: string) => ({ turnId: 'tt-' + id, agentId: id, answer: '', durationMs: 1, isAborted: false, reason: 'answer' }) as any
+const flush = () => new Promise<void>((r) => setTimeout(r, 5))
 const last = (w: ReturnType<typeof world>) => w.writes.at(-1)!.json
 
 test('a routed subagent shows up at turn.start and leaves at turn.complete', { options: { typesafeApiKey: KEY } }, async ($, on) => {
   const w = world(on)
   mock.clock(on)
   await $.agent.spawn(spawnInput())
+  await flush()
   expect(w.writes.length).toBe(0) // routed, not running yet
   await $.turn.start(start('ag1'))
+  await flush()
   expect(w.writes.at(-1)!.path).toBe('/home/me/.claude/state/jev-model-router/sess-1.json')
   expect(last(w)).toMatchObject({ v: 1, sessionId: 'sess-1' })
   expect(last(w).active).toMatchObject([{ agentId: 'ag1', model: 'haiku', effort: 'low', fallback: false }])
   await $.turn.complete(done('ag1'))
+  await flush()
   expect(last(w).active).toEqual([])
 })
 
@@ -246,6 +297,7 @@ test('turn.start before the spawn returns is picked up at the bind', { options: 
   const w = world(on, { HOME: '/home/me' }, ['fast'], { spawn: async () => void (await $.turn.start(start('ag1'))) })
   mock.clock(on)
   await $.agent.spawn(spawnInput())
+  await flush()
   expect(last(w).active.map((a: any) => a.agentId)).toEqual(['ag1'])
 })
 
@@ -253,8 +305,11 @@ test('statusFile off writes nothing', { options: { typesafeApiKey: KEY, statusFi
   const w = world(on)
   mock.clock(on)
   await $.agent.spawn(spawnInput())
+  await flush()
   await $.turn.start(start('ag1'))
+  await flush()
   await $.turn.complete(done('ag1'))
+  await flush()
   expect(w.writes.length).toBe(0)
 })
 
@@ -262,7 +317,9 @@ test('CLAUDE_CONFIG_DIR wins over HOME; no HOME and no config dir writes nothing
   const w = world(on, { CLAUDE_CONFIG_DIR: '/cfg/boosta', HOME: '/home/me' })
   mock.clock(on)
   await $.agent.spawn(spawnInput())
+  await flush()
   await $.turn.start(start('ag1'))
+  await flush()
   expect(w.writes.at(-1)!.path).toBe('/cfg/boosta/state/jev-model-router/sess-1.json')
 })
 
@@ -270,7 +327,9 @@ test('no config dir and no HOME: nothing is written, nothing throws', { options:
   const w = world(on, {})
   mock.clock(on)
   await $.agent.spawn(spawnInput())
+  await flush()
   await $.turn.start(start('ag1'))
+  await flush()
   expect(w.writes.length).toBe(0)
 })
 
@@ -278,7 +337,9 @@ test('the model is the one it runs on (override), and a fallback is flagged', { 
   const w = world(on, { HOME: '/home/me' }, ['fast'], { fetch: () => ({ status: 500, text: 'boom' }), spawnModel: 'claude-opus-5-5' })
   mock.clock(on)
   await $.agent.spawn(spawnInput())
+  await flush()
   await $.turn.start(start('ag1'))
+  await flush()
   expect(last(w).active).toMatchObject([{ model: 'opus', effort: 'high', fallback: true }])
 })
 
@@ -286,7 +347,9 @@ test('forks and resumes (unrouted) are not counted', { options: { typesafeApiKey
   const w = world(on)
   mock.clock(on)
   await $.agent.spawn(spawnInput({ fork: true }))
+  await flush()
   await $.turn.start(start('ag1'))
+  await flush()
   expect(w.writes.length).toBe(0)
 })
 
@@ -295,7 +358,9 @@ test('concurrent agents aggregate; steps do not write', { options: { typesafeApi
   mock.clock(on)
   for (const id of ['ag1', 'ag2', 'ag3']) {
     await $.agent.spawn(spawnInput())
+    await flush()
     await $.turn.start(start(id))
+    await flush()
   }
   expect(last(w).active.map((a: any) => `${a.model}/${a.effort}`)).toEqual(['haiku/low', 'opus/high', 'opus/high'])
   const before = w.writes.length
@@ -309,7 +374,9 @@ test('heartbeat rewrites while active, prunes finished agents, and stops when em
   const w = world(on)
   const clock = mock.clock(on)
   await $.agent.spawn(spawnInput())
+  await flush()
   await $.turn.start(start('ag1'))
+  await flush()
   const n = w.writes.length
   const t0 = last(w).updatedAt
   await clock.advance(HEARTBEAT_MS)
@@ -331,8 +398,36 @@ test('session.end and session.start reset the file', { options: { typesafeApiKey
   on('session.end', async () => ({ sessionId: 'sess-1' }) as never)
   on('session.start', async (_$: any, e: any) => ({ cwd: e.cwd }) as never)
   await $.agent.spawn(spawnInput())
+  await flush()
   await $.turn.start(start('ag1'))
+  await flush()
   expect(last(w).active.length).toBe(1)
   await $.session.end({ reason: 'exit' } as never)
+  await flush()
   expect(last(w).active).toEqual([])
+})
+
+test('a hung fs.write never holds up turn.start or the spawn result', { options: { typesafeApiKey: KEY } }, async ($, on) => {
+  const w = world(on)
+  w.hang = true // fs.write never settles
+  mock.clock(on)
+  const spawned = await Promise.race([$.agent.spawn(spawnInput()).then(() => 'ok'), new Promise((r) => setTimeout(() => r('hung'), 500))])
+  expect(spawned).toBe('ok')
+  const started = await Promise.race([$.turn.start(start('ag1')).then(() => 'ok'), new Promise((r) => setTimeout(() => r('hung'), 500))])
+  expect(started).toBe('ok')
+})
+
+test('a model the engine reports as nothing is written as "unknown", never empty', { options: { typesafeApiKey: KEY } }, async ($, on) => {
+  const w = world(on, { HOME: '/home/me' }, ['fast'], { spawnModel: '' })
+  mock.clock(on)
+  await $.agent.spawn(spawnInput({ model: undefined }))
+  await $.turn.start(start('ag1'))
+  await flush()
+  expect(last(w).active.every((a: any) => a.model.length > 0)).toBe(true)
+})
+
+test('the written file keeps the contract shape byte for byte', () => {
+  expect(serialize('s', 5, [{ agentId: 'a', model: 'opus', effort: null, fallback: false, startedAt: 1 }])).toBe(
+    '{"v":1,"sessionId":"s","updatedAt":5,"active":[{"agentId":"a","model":"opus","effort":null,"fallback":false,"startedAt":1}]}',
+  )
 })
