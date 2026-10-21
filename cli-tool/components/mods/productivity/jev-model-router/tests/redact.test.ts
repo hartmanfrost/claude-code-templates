@@ -337,3 +337,102 @@ test('error text is scrubbed before it is logged, whatever the settings', () => 
   expect(line).toContain('[REDACTED:github-token]')
   expect(scrubForLog('x'.repeat(500)).length).toBe(201)
 })
+
+// --- review fixes ---------------------------------------------------------------
+
+test('url credentials: an unencoded @ or / in the password does not leak its tail', () => {
+  expect(out('postgres://user:p@ss/word@host/db')).toBe('postgres://[REDACTED:url-credentials]@host/db')
+  expect(out('postgres://user:p@ss@host/db')).toBe('postgres://[REDACTED:url-credentials]@host/db')
+  expect(out('postgres://user:p/ss@host/db')).toBe('postgres://[REDACTED:url-credentials]@host/db')
+  // No userinfo: untouched.
+  expect(out('see https://github.com:443/foo/bar for details')).toBe('see https://github.com:443/foo/bar for details')
+})
+
+test('an unterminated BEGIN marker redacts the key material, not the prose after it', () => {
+  const stray = 'the file starts with -----BEGIN ' + 'PRIVATE KEY----- then implement the retry logic'
+  expect(out(stray)).toBe('the file starts with [REDACTED:private-key] then implement the retry logic')
+  const cut = 'before\n-----BEGIN ' + 'PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\nKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\n'
+  expect(out(cut)).toBe('before\n[REDACTED:private-key]\n')
+  const withTask = cut + 'now implement the retry logic'
+  expect(out(withTask)).toBe('before\n[REDACTED:private-key]\nnow implement the retry logic')
+})
+
+test('a bare value that merely starts with a type or reference word is still a secret', () => {
+  expect(out('password=options-Gm3x9Kq2')).toBe('password=[REDACTED:secret-assignment]')
+  expect(out('token=env-9f8e7d6c5b')).toBe('token=[REDACTED:secret-assignment]')
+  // ...while the real references and types stay.
+  expect(out('password: string')).toBe('password: string')
+  expect(out('token = process.env.TOKEN')).toBe('token = process.env.TOKEN')
+  expect(out('const password: Optional[str] = None')).toBe('const password: Optional[str] = None')
+})
+
+test('short unquoted passwords in env-style assignments are redacted', () => {
+  expect(out('PASSWORD=hunter2')).toBe('PASSWORD=[REDACTED:secret-assignment]')
+  expect(out('api_key: abc123')).toBe('api_key: [REDACTED:secret-assignment]')
+  expect(out('password: 1234')).toBe('password: [REDACTED:secret-assignment]')
+  expect(out('const token = getToken()')).toBe('const token = getToken()')
+  expect(out('max_tokens: 1024')).toBe('max_tokens: 1024')
+})
+
+test('quoted passwords starting with $, #, % or @ are redacted; real references are not', () => {
+  for (const v of ['$ecretPass123', '#Abc12345', '%Abc12345', '@Xy12345678']) {
+    expect(out(`password="${v}"`)).toBe('password="[REDACTED:secret-assignment]"')
+  }
+  for (const ref of ['${PASSWORD}', '$DB_PASS', '{{ secrets.db }}', '<your-password>', '%(password)s']) {
+    expect(out(`password: "${ref}"`)).toBe(`password: "${ref}"`)
+  }
+})
+
+test('Rails-style and suffixed secret names are detected', () => {
+  expect(out('SECRET_KEY_BASE=abcdef0123456789abcdef')).toBe('SECRET_KEY_BASE=[REDACTED:secret-assignment]')
+  expect(out('DB_SECRET_VALUE=abcdef0123456789abcdef')).toBe('DB_SECRET_VALUE=[REDACTED:secret-assignment]')
+  expect(out('secret_key_base: "abcdef0123456789abcdef"')).toBe('secret_key_base: "[REDACTED:secret-assignment]"')
+})
+
+test('delimiter characters inside a password do not leak the remainder', () => {
+  expect(out('DB_PASSWORD=Pa$$w0rd;x9!qz1')).toBe('DB_PASSWORD=[REDACTED:secret-assignment]')
+  expect(out('DB_PASSWORD=abc;defghijk')).toBe('DB_PASSWORD=[REDACTED:secret-assignment]')
+  expect(out('PASSWORD=hunter2,foo')).toBe('PASSWORD=[REDACTED:secret-assignment]')
+  // A delimiter at the end of the value still ends it.
+  expect(out('connect(token=abcd1234)')).toBe('connect(token=[REDACTED:secret-assignment])')
+})
+
+test('short Basic and Bearer credentials are redacted, prose is not', () => {
+  expect(out('Authorization: Basic dXNlcjpwYXNz')).toBe('Authorization: Basic [REDACTED:bearer-token]')
+  expect(out('Authorization: Bearer abc12345')).toBe('Authorization: Bearer [REDACTED:bearer-token]')
+  expect(out('Basic authentication is supported')).toBe('Basic authentication is supported')
+  expect(out('Bearer tokens expire quickly')).toBe('Bearer tokens expire quickly')
+  expect(out('Basic Configuration of the router')).toBe('Basic Configuration of the router')
+})
+
+test('prose passphrases are redacted, UI labels are not', () => {
+  expect(out('password = "correct horse battery staple"')).toBe('password = "[REDACTED:secret-assignment]"')
+  expect(out('password: "Enter your password"')).toBe('password: "Enter your password"')
+  expect(out('password: "Must be at least eight characters"')).toBe('password: "Must be at least eight characters"')
+})
+
+test('Stripe, npm, GitLab, HuggingFace and Vercel keys are redacted', () => {
+  const cases: [string, string][] = [
+    ['sk_' + 'live_' + 'A1b2C3d4E5f6G7h8I9j0', 'stripe-key'],
+    ['npm_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6q7R8', 'npm-token'],
+    ['glpat-' + 'a1B2c3D4e5F6g7H8i9J0', 'gitlab-token'],
+    ['hf_' + 'a1B2c3D4e5F6g7H8i9J0k1L2m3N4o5P6', 'huggingface-token'],
+    ['vck_' + 'a1B2c3D4e5F6g7H8i9J0k1L2', 'vercel-key'],
+  ]
+  for (const [key, type] of cases) expect(out(`use ${key} now`)).toBe(`use [REDACTED:${type}] now`)
+  expect(out('the hf_hub module and an npm_config_cache variable')).toBe('the hf_hub module and an npm_config_cache variable')
+})
+
+test('custom patterns: alternation inside a repeated group is refused as a backtracking risk', () => {
+  for (const bad of ['(?:a|aa)+$', '(a|a)*b', '((a|b))*c', '(a+)+', '(.*a){8}x']) {
+    const { patterns, errors } = compileCustomPatterns([bad])
+    expect(patterns.length).toBe(0)
+    expect(errors.length).toBe(1)
+    expect(errors[0]).toContain('#1')
+    expect(errors[0]).not.toContain(bad)
+  }
+  // Safe shapes still compile.
+  const ok = compileCustomPatterns(['ACME-[0-9]{6}', 'foo(?:bar|baz)', '[a+*]+x', '(abc)?d'])
+  expect(ok.patterns.length).toBe(4)
+  expect(ok.errors.length).toBe(0)
+})

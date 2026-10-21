@@ -40,7 +40,7 @@ With both main-loop switches off, the `prompt.submit` hook returns immediately: 
    A decision that agrees with the fallback or misses its bar yields the fallback. The model is **always named explicitly** (`next({...e, model})`), whatever the caller passed and whatever the parent runs; the earlier "compare against `e.model ?? e.parentModel`" logic made "deep" look like no change when the parent was `opus[1m]` and the subagent actually ran on `CLAUDE_CODE_SUBAGENT_MODEL=sonnet`.
 4. `agent.spawn` hands back the new agent's `agentId`. The effort is filed under that id and, because the agent's own `turn.start` can be raised before the spawn returns, also under a hash of its prompt; whichever arrives first binds it. Every `turn.step` of that agent is then rewritten to the effort, and `turn.complete` drops the entry.
 
-Verified live on Claude Code 2.1.305, headless: a spawn hook's model rewrite wins even with `CLAUDE_CODE_SUBAGENT_MODEL=sonnet` set; `turn.step` fires for Agent-tool subagents and Workflow agents with the same `agentId` that `agent.spawn` returned; the rewritten effort reaches the request (haiku, sonnet and opus all accepted `low` through `xhigh`). If a future build lets the session force the subagent model over a hook, the router notices that the spawn came back on a different tier and tells you once.
+Observed by hand on Claude Code 2.1.305, headless (a one-off probe, not reproducible from this repo; `tests/hook.test.ts` covers the router's side of it against engine stand-ins, including the `turn.start`-before-spawn-returns ordering): a spawn hook's model rewrite wins even with `CLAUDE_CODE_SUBAGENT_MODEL=sonnet` set; `turn.step` fires for Agent-tool subagents and Workflow agents with the same `agentId` that `agent.spawn` returned; the rewritten effort reaches the request (haiku, sonnet and opus all accepted `low` through `xhigh`). If a future build lets the session force the subagent model over a hook, the router notices that the spawn came back on a different tier and tells you once.
 
 ## Failure is loud
 
@@ -93,19 +93,20 @@ Before anything is sent, every text field is scrubbed and **then** truncated, so
 | `github-token` | `ghp_ gho_ ghu_ ghs_ ghr_` and `github_pat_` |
 | `aws-access-key`, `aws-secret` | `AKIA`/`ASIA` ids, `aws_secret_access_key` assignments |
 | `slack-token`, `google-api-key`, `jwt` | `xox[abprs]-`/`xapp-`, `AIza...`, `eyJ...eyJ...sig` |
-| `bearer-token` | `Bearer`/`Basic` header values (a digit, or long and mixed-case; prose like "Bearer token authentication" is left) |
-| `url-credentials` | `scheme://user:pass@host` (the host is kept) |
+| `bearer-token` | `Bearer`/`Basic` header values of 8+ characters with a digit, `+/=` or an interior capital (`Basic dXNlcjpwYXNz`); prose like "Bearer token authentication" or "Basic Configuration" is left |
+| `stripe-key`, `npm-token`, `gitlab-token`, `huggingface-token`, `vercel-key` | `sk_live_`/`rk_test_...`, `npm_...`, `glpat-...`, `hf_...`, `vck_...` (the Gateway's own key shape) |
+| `url-credentials` | `scheme://user:pass@host` (the host is kept); the password runs to the LAST `@`, so an unencoded `@` or `/` in it does not leak its tail |
 | `cli-secret` | `--password`, `--token`, `--secret`, `--api-key`, `--access-key` values |
-| `secret-assignment` | `NAME=value`, `NAME: value`, `"name": "value"`, `export NAME=...` where the name ends in key/token/secret/password/passwd/pwd/credential(s) |
+| `secret-assignment` | `NAME=value`, `NAME: value`, `"name": "value"`, `export NAME=...` where the name ends in key/token/secret/password/passwd/pwd/credential(s) (optionally followed by `_base`/`_value`/`_string`/`_data`/`_content`/`_text`, so `SECRET_KEY_BASE` counts). Short values (4+ characters) and values containing `, ; ) } ]` are covered; `$VAR`, `${X}`, `{{ x }}`, `<x>` references and UI-label prose (`"Enter your password"`) are not, while `"$ecretPass1"`, `"#Abc1234"` and `"correct horse battery staple"` are |
 | `high-entropy-hex`, `high-entropy-base64` | hex of 64+ characters and base64-like runs of 40+ characters with mixed case, digits and high entropy |
 
-Optional, **off by default**, each its own switch: `redactEmails` (`email`), `redactIps` (`ipv4`, `ipv6`), `redactHomePaths` (`/home/<user>`, `/Users/<user>`, `C:\Users\<user>` become `~`). `redactPatterns` adds your own regular expressions, one per line (or a JSON array of strings); matches become `[REDACTED:custom]`. A pattern that is invalid, longer than 200 characters, has a nested quantifier or backreference (backtracking risk) or matches the empty string is skipped and reported once, by position, never by its text.
+Optional, **off by default**, each its own switch: `redactEmails` (`email`), `redactIps` (`ipv4`, `ipv6`), `redactHomePaths` (`/home/<user>`, `/Users/<user>`, `C:\Users\<user>` become `~`). `redactPatterns` adds your own regular expressions, one per line (or a JSON array of strings); matches become `[REDACTED:custom]`. A pattern that is invalid, longer than 200 characters, has a backreference or a repeated group holding a quantifier or an alternation such as `(a+)+` or `(?:a|aa)+` (backtracking risk; this check errs shut, so `(?:foo|bar)+` is refused too) or matches the empty string is skipped and reported once, by position, never by its text.
 
 Ordinary code is deliberately left alone: `const token = getToken()`, `password: string`, `max_tokens: 4096`, `tokenizer: "..."`, `sortKey: "name"`, `password: ${PASSWORD}`, git hashes, lockfile hashes, UUIDs and file paths are not redacted.
 
-**This is best effort, not a guarantee.** A pattern list cannot know every secret; a secret written as prose ("the password is correct horse battery"), a short or low-entropy password in free text, a key in an unusual format, or sensitive business content that has no secret shape will go through. Redaction only protects what it recognises. If a prompt may carry something you cannot afford to send, switch the router off or keep `routeSubagentModel`/`routeSubagentEffort` off for that session.
+**This is best effort, not a guarantee.** A pattern list cannot know every secret; a secret written as prose in free text (only `NAME = "words"` assignments are caught), a short or low-entropy password in free text, an unquoted bare-word password (`password: hunter` has no digit and is read as a type or identifier), a key in an unusual format, or sensitive business content that has no secret shape will go through. Redaction only protects what it recognises. If a prompt may carry something you cannot afford to send, switch the router off or keep `routeSubagentModel`/`routeSubagentEffort` off for that session.
 
-Linear time: built-in detectors use literal prefixes and bounded, non-overlapping classes (and plain `indexOf` for armored blocks), and each field is cut to 100 000 characters before any pattern runs. Your own patterns cannot be proven linear in JavaScript; the input bound and the nested-quantifier check are the only guards, so keep them simple.
+Linear time: built-in detectors use literal prefixes and bounded, non-overlapping classes (and plain `indexOf` for armored blocks), and each field is cut to 100 000 characters before any pattern runs. Your own patterns cannot be proven linear in JavaScript; the input bound and the backtracking check (a heuristic, not a proof) are the only guards, so keep them simple.
 
 ## Limitations
 
@@ -117,6 +118,16 @@ Linear time: built-in detectors use literal prefixes and bounded, non-overlappin
 - **Timeouts do not cancel the request** (no abort signal on `$.http.fetch`); a late answer is dropped.
 - **Toasts** only exist in an interactive terminal; `claude -p` and the SDK get the transcript line and the debug log.
 - **Main-loop routing**, if switched on, is fail-open: on any failure the turn runs unchanged (it has no fallback to apply), and the failure is shown the same way.
+
+## What changed in 0.5.0-hartmanfrost.2
+
+Fixes from review of `.1`:
+
+- **Keyless / `no-key` notice is once.** The scope-prefixed class (`subagent:no-key`) was escalating at 1, 5, 25 ... ; it is now shown once, and the status line moves only with a shown notice.
+- **Risk never lowers the main-loop model** (`routeMainModel`), matching the subagent path and the effort path.
+- **Effort plans:** an agent that already claimed its entry no longer takes a second spawn's entry for the same prompt.
+- **Redaction:** URL passwords with `@` or `/`; an unterminated `BEGIN ... PRIVATE KEY` marker takes the key body, not the prose after it; values that merely start with `options`/`env`/`config`...; short and delimiter-containing passwords; quoted passwords starting with `$ # % @`; `SECRET_KEY_BASE`-style names; short `Basic`/`Bearer` values; prose passphrases; Stripe, npm, GitLab, HuggingFace and Vercel keys; the custom-pattern guard now sees alternation and nesting. Custom patterns remain a heuristic.
+- `tests/hook.test.ts` (engine-driven), an icon, and a root `.claude-plugin/marketplace.json` for installing this fork.
 
 ## What changed from 0.4.2
 
@@ -185,6 +196,8 @@ claude
 claude --plugin-dir .claude/skills/jev-model-router
 ```
 
+From this fork's marketplace: `/plugin marketplace add hartmanfrost/claude-code-templates`, then `/plugin install jev-model-router --marketplace hartmanfrost/claude-code-templates`.
+
 `claude plugin validate .claude/skills/jev-model-router` prints every event it hooks and every `$` call it makes.
 
 ## Tests
@@ -193,6 +206,6 @@ claude --plugin-dir .claude/skills/jev-model-router
 claude plugin test cli-tool/components/mods/productivity/jev-model-router
 ```
 
-Pure logic only (`tests/policy.test.ts`, `tests/router.test.ts`, `tests/redact.test.ts`): no network, no `$`. Redaction has positive and negative cases per detector, placeholder format, truncation after redaction, custom patterns and an adversarial-input timing check.
+Pure logic (`tests/policy.test.ts`, `tests/router.test.ts`, `tests/redact.test.ts`: no network, no `$`) plus engine-driven hook tests (`tests/hook.test.ts`), which load the real hooks over stand-ins for the network and the UI: routing off makes no call, the caller's model is overridden, effort is bound by `agentId`, applied at `turn.step` and dropped at `turn.complete`, every failure kind falls back with a toast, keyless gives one notice and never calls the classifier, resumes/forks/teammates/placeholders make no call, and a secret never reaches the request body. Redaction has positive and negative cases per detector, placeholder format, truncation after redaction, custom patterns and an adversarial-input timing check.
 
 **Requirements.** Mods are on by default in Claude Code 2.1.287+. A mod runs without `node_modules`, so both backends are spoken to over HTTP through `$.http.fetch`. The TypeSafe wire shape was read from `@typesafe-ai/sdk` v0.6.0; the Gateway's, which is `experimental` in the AI SDK and not documented publicly, from `@ai-sdk/gateway` v4.0.86 and `@ai-sdk/provider` v4.0.17. Either may change.

@@ -17,8 +17,9 @@
  * no input makes the engine backtrack catastrophically. The input is also cut
  * to MAX_INPUT before any pattern runs. User patterns (`redactPatterns`)
  * cannot be proven linear in JavaScript; the input bound is the only guard
- * for those, plus a heuristic that refuses the obvious nested-quantifier
- * shapes.
+ * for those, plus a conservative scan (riskyPattern) that refuses a repeated
+ * group holding a quantifier or an alternation, and backreferences. It is a
+ * heuristic, not a proof.
  *
  * Matched values are never logged or returned: callers only ever see counts
  * per type.
@@ -72,11 +73,38 @@ export function entropy(text: string): number {
   return bits
 }
 
+const PEM_BODY_LINE = /^[ \t]*[A-Za-z0-9+/=]{16,}[ \t]*$/
+const PEM_HEADER_LINE = /^[A-Za-z][A-Za-z -]{1,30}:[^\n]{0,100}$/
+
+/**
+ * Where the body of an armored block with no END marker stops: after the run
+ * of base64 / header lines that follows the BEGIN line. Anything else on the
+ * BEGIN line, or a first line that is not key material, ends it at once.
+ */
+function unterminatedBodyEnd(text: string, from: number): number {
+  let nl = text.indexOf('\n', from)
+  if (nl === -1) return text.slice(from).trim() === '' ? text.length : from
+  if (text.slice(from, nl).trim() !== '') return from
+  let end = from
+  let lines = 0
+  while (nl !== -1 && lines < 5000) {
+    const next = text.indexOf('\n', nl + 1)
+    const line = text.slice(nl + 1, next === -1 ? text.length : next).replace(/\r$/, '')
+    const isBlank = line.trim() === ''
+    if (!isBlank && !PEM_BODY_LINE.test(line) && !PEM_HEADER_LINE.test(line)) break
+    if (!isBlank) end = next === -1 ? text.length : next
+    nl = next
+    lines += 1
+  }
+  return end
+}
+
 /**
  * Armored blocks, found with `indexOf` rather than a lazy regex: a lazy
  * `[\s\S]*?` per BEGIN marker is quadratic on many unterminated markers.
- * A block with no END marker is redacted to the end of the text, because
- * the input may have been cut inside it.
+ * A block with no END marker is redacted through the key material that
+ * follows its header (the input may have been cut inside it), not to the end
+ * of the text.
  */
 function redactBlocks(text: string, counts: RedactCounts): string {
   const BEGIN = '-----BEGIN '
@@ -104,7 +132,10 @@ function redactBlocks(text: string, counts: RedactCounts): string {
     const headerEnd = labelStart + rel + 5
     const endMarker = `-----END ${label}-----`
     const endAt = text.indexOf(endMarker, headerEnd)
-    const stop = endAt === -1 ? text.length : endAt + endMarker.length
+    // Unterminated: the input may have been cut inside the key, so take the
+    // body that follows (base64 lines and PEM headers) but NOT the prose after
+    // a stray mention of the marker.
+    const stop = endAt === -1 ? unterminatedBodyEnd(text, headerEnd) : endAt + endMarker.length
     out += text.slice(pos, start) + placeholder(type)
     bump(counts, type)
     pos = stop
@@ -138,6 +169,11 @@ const ANTHROPIC_KEY = /\bsk-ant-[A-Za-z0-9_-]{20,}/g
 const OPENAI_KEY = /\bsk-(?:proj-|svcacct-|admin-)?(?=[A-Za-z0-9_-]{0,200}\d)[A-Za-z0-9_-]{20,}/g
 const TYPESAFE_KEY = /\bapikey_[A-Za-z0-9_-]{16,}/g
 const GITHUB_TOKEN = /\b(?:gh[pousr]_[A-Za-z0-9]{36,255}|github_pat_[A-Za-z0-9_]{50,255})/g
+const STRIPE_KEY = /\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}/g
+const NPM_TOKEN = /\bnpm_[A-Za-z0-9]{36}\b/g
+const GITLAB_TOKEN = /\bglpat-[A-Za-z0-9_-]{20,}/g
+const HF_TOKEN = /\bhf_[A-Za-z0-9]{30,}/g
+const VERCEL_KEY = /\bvck_[A-Za-z0-9_-]{20,}/g
 const AWS_ACCESS_KEY = /\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g
 const AWS_SECRET = /(aws_secret_access_key["']?[ \t]{0,3}[:=][ \t]{0,3}["']?)[A-Za-z0-9/+=]{40}["']?/gi
 const SLACK_TOKEN = /\bxox[abprs]-[A-Za-z0-9-]{10,}|\bxapp-[A-Za-z0-9-]{10,}/g
@@ -145,8 +181,10 @@ const GOOGLE_KEY = /\bAIza[A-Za-z0-9_-]{35}/g
 const JWT = /\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g
 const AGE_SECRET_KEY = /\bAGE-SECRET-KEY-1[0-9A-Z]{50,}/g
 const SOPS_VALUE = /ENC\[AES256_GCM,[^\]]{1,4000}\]/g
-const AUTH_VALUE = /\b(Bearer|Basic)([ \t]+)([A-Za-z0-9._~+/=-]{20,})/gi
-const URL_CREDENTIALS = /\b([a-z][a-z0-9+.-]{1,20}:\/\/)([^\s/@:'"]{1,100}):([^\s/@'"]{1,200})@/gi
+const AUTH_VALUE = /\b(Bearer|Basic)([ \t]+)([A-Za-z0-9._~+/=-]{8,})/gi
+// The password runs to the LAST '@' of the whitespace-free run, so an
+// unencoded '@' or '/' inside it cannot leak its tail.
+const URL_CREDENTIALS = /\b([a-z][a-z0-9+.-]{1,20}:\/\/)([^\s/@:'"]{1,100}):([^\s'"]{1,200})@/gi
 const URL_TOKEN_USER = /\b([a-z][a-z0-9+.-]{1,20}:\/\/)([A-Za-z0-9._~-]{24,200})@/gi
 const CLI_SECRET_FLAG =
   /(--(?:password|passwd|token|secret|api[-_]?key|access[-_]?key|auth[-_]?token)(?:=|[ \t]+)["']?)([^\s"'$-][^\s"']{3,200})/gi
@@ -165,28 +203,46 @@ const ASSIGNMENT = new RegExp(
     '(?:api|access|private|secret|auth|encryption|signing|master|ssh|license|client|app|session|service)[_-]?key|' +
     'secret|token|password|passwd|pwd|credentials?' +
     ')s?(?:[_-]?\\d{1,3})?)' +
+    '(?:[_-](?:base|value|string|data|content|text))?' +
     '["\']?([ \\t]{0,3}(?::=|=>|=|:)[ \\t]{0,3})' +
-    '("[^"\\n]{1,500}"|\'[^\'\\n]{1,500}\'|[^\\s"\',;)}\\]]{1,500})',
+    // Unquoted: a delimiter ends the value only at its end; inside a password
+    // (`Pa$$w0rd;x9!qz1`) it is part of it.
+    '("[^"\\n]{1,500}"|\'[^\'\\n]{1,500}\'|(?:[^\\s"\',;)}\\]]|[,;)}\\]](?=[^\\s"\',;)}\\]])){1,500})',
   'gi',
 )
 
 /** Counters and sizes, not credentials: `max_tokens`, `inputTokens`. */
 const NON_SECRET_NAME = /(?:max|min|num|total|input|output|prompt|completion|context|cache|reasoning|n)[_-]?tokens?\d*$/i
 
-/** What a bare (unquoted) value that is a type, a reference or a call looks like. */
+/**
+ * A bare value that is wholly a type, a reference or a call target:
+ * `string`, `process.env`, `os.environ[`, `Optional[str`. The word must be the
+ * WHOLE value (or a dotted / indexed path from it), so `options-Gm3x9Kq2` and
+ * `env-9f8e7d6c5b` are values, not references.
+ */
 const NON_VALUE_WORD =
-  /^(?:string|number|boolean|bool|any|unknown|never|null|undefined|nil|none|true|false|void|str|int|bytes|secretstr|optional|required|ref|process|os|env|config|settings|this|self|args|params|opts|options|input|req|request|ctx|getenv|require)\b/i
+  /^(?:string|number|boolean|bool|any|unknown|never|null|undefined|nil|none|true|false|void|str|int|bytes|secretstr|optional|required|ref|process|os|env|config|settings|this|self|args|params|opts|options|input|req|request|ctx|getenv|require)(?:[.[][\w.[]*)?$/i
+
+/** A value that only points at a secret kept elsewhere: `$DB_PASS`, `${X}`, `{{ x }}`, `<token>`, `%(x)s`. */
+const REFERENCE_VALUE =
+  /^(?:\$\{[^}\s]{1,100}\}?|\$\([^)\s]{1,100}\)?|\$[A-Z_][A-Z0-9_]*$|\{\{|<[^<>\s]{1,60}>?$|%\([A-Za-z_]\w*\)s|%[A-Z_][A-Z0-9_]*%|#\{|\[REDACTED:)/
+
+/** A quoted value that reads as a UI label or message, not a passphrase. */
+const LABEL_PROSE =
+  /^(?:enter|your|the|please|type|confirm|new|current|old|set|choose|must|should|invalid|incorrect|wrong|missing|required|forgot|reset|a|an|at|is|for|to|not|no|do|use|input|provide|repeat|retype)\b/i
 
 function looksLikeSecretValue(sep: string, raw: string): boolean {
   const quoted = raw.startsWith('"') || raw.startsWith("'")
   const v = quoted ? raw.slice(1, -1) : raw
-  if (v.length < (quoted ? 4 : 6)) return false
+  if (v.length < 4) return false
   // Template and variable references, and values already masked.
-  if (/^(?:\$|%|<|\{\{|@|#|\[REDACTED:)/.test(v)) return false
+  if (REFERENCE_VALUE.test(v)) return false
   if (/^(?:x{3,}|\*{3,}|\.{3,}|_{3,}|-{3,}|changeme|your[_-]|example|placeholder|redacted)/i.test(v)) return false
   if (quoted) {
-    // Prose ("Enter your password") is a label, not a secret.
-    if (/^[A-Za-z' ,.!?-]+$/.test(v) && (v.match(/ /g) ?? []).length >= 2) return false
+    // Prose ("Enter your password") is a label, not a secret; a bare run of
+    // words that does not read as a label ("correct horse battery staple")
+    // is taken for a passphrase.
+    if (/^[A-Za-z' ,.!?-]+$/.test(v) && (v.match(/ /g) ?? []).length >= 2 && LABEL_PROSE.test(v)) return false
     return true
   }
   if (v.includes('(')) return false // a call
@@ -196,7 +252,7 @@ function looksLikeSecretValue(sep: string, raw: string): boolean {
     // Only the tight env-file form `NAME=word` is taken for a secret.
     return sep === '=' && v.length >= 8
   }
-  return v.length >= 8
+  return true
 }
 
 const HEX_BLOB = /(?<![A-Za-z0-9+/_=-])[0-9a-fA-F]{64,}(?![A-Za-z0-9+/_=-])/g
@@ -243,6 +299,11 @@ export function redact(text: string, options: RedactOptions): { text: string; co
   out = sub(out, OPENAI_KEY, 'openai-key', counts)
   out = sub(out, TYPESAFE_KEY, 'typesafe-key', counts)
   out = sub(out, GITHUB_TOKEN, 'github-token', counts)
+  out = sub(out, STRIPE_KEY, 'stripe-key', counts)
+  out = sub(out, NPM_TOKEN, 'npm-token', counts)
+  out = sub(out, GITLAB_TOKEN, 'gitlab-token', counts)
+  out = sub(out, HF_TOKEN, 'huggingface-token', counts)
+  out = sub(out, VERCEL_KEY, 'vercel-key', counts)
   out = sub(out, AWS_ACCESS_KEY, 'aws-access-key', counts)
   out = sub(out, AWS_SECRET, 'aws-secret', counts, (_m, g) => `${g[0]}${placeholder('aws-secret')}`)
   out = sub(out, SLACK_TOKEN, 'slack-token', counts)
@@ -254,9 +315,12 @@ export function redact(text: string, options: RedactOptions): { text: string; co
   )
   out = sub(out, AUTH_VALUE, 'bearer-token', counts, (_m, g) => {
     const value = g[2] ?? ''
-    // `Basic authentication-methods...` is prose; a credential has a digit
-    // or is long and mixed-case.
-    const secret = /\d/.test(value) || (value.length >= 32 && /[A-Z]/.test(value) && /[a-z]/.test(value))
+    // `Basic authentication-methods...` is prose; a credential has a digit,
+    // base64 punctuation or interior capitals.
+    const secret =
+      /\d/.test(value) ||
+      /[+/=]/.test(value) ||
+      /[A-Z]/.test(value.slice(1)) // `dXNlcjpwYXNz`; prose words are lower-case or Capitalised
     return secret ? `${g[0]}${g[1]}${placeholder('bearer-token')}` : null
   })
   out = sub(out, CLI_SECRET_FLAG, 'cli-secret', counts, (_m, g) => `${g[0]}${placeholder('cli-secret')}`)
@@ -337,8 +401,47 @@ export function scrubForLog(text: string, max = 200): string {
   return scrubbed.length > max ? `${scrubbed.slice(0, max)}…` : scrubbed
 }
 
-/** Shapes that make a backtracking engine blow up: a quantified group holding a quantifier. */
-const NESTED_QUANTIFIER = /\((?:[^()\\]|\\.)*[+*](?:[^()\\]|\\.)*\)[+*{]|\\[1-9]/
+/**
+ * Heuristic guard against catastrophic backtracking: refuses a pattern with a
+ * backreference, or with a group that is repeated (`+ * {n,}`) and holds
+ * a quantifier, an alternation or another repeated group, at any depth
+ * (`(a+)+`, `(?:a|aa)+`, `((a|b))*`). It over-refuses (`(?:foo|bar)+` is
+ * safe but refused); user patterns cannot be proven linear, so it errs shut.
+ */
+export function riskyPattern(source: string): boolean {
+  if (/\\[1-9]|\\k</.test(source)) return true
+  // Each stack frame: does this group hold a quantifier or an alternation?
+  const stack: boolean[] = []
+  let inClass = false
+  for (let i = 0; i < source.length; i++) {
+    const c = source[i] as string
+    if (c === '\\') {
+      i += 1
+      continue
+    }
+    if (inClass) {
+      if (c === ']') inClass = false
+      continue
+    }
+    if (c === '[') inClass = true
+    else if (c === '(') stack.push(false)
+    else if (c === '|') {
+      if (stack.length > 0) stack[stack.length - 1] = true
+    } else if (c === '+' || c === '*') {
+      if (stack.length > 0) stack[stack.length - 1] = true
+    } else if (c === '{' && /^\{\d+,\d*\}/.test(source.slice(i))) {
+      if (stack.length > 0) stack[stack.length - 1] = true
+    } else if (c === ')') {
+      const inner = stack.pop() ?? false
+      const after = source[i + 1]
+      const repeated = after === '+' || after === '*' || (after === '{' && /^\{\d+(?:,\d*)?\}/.test(source.slice(i + 1)) && !/^\{1\}/.test(source.slice(i + 1)))
+      if (inner && repeated) return true
+      // What a group holds, or a repeated group itself, counts for its parent.
+      if ((inner || repeated) && stack.length > 0) stack[stack.length - 1] = true
+    }
+  }
+  return false
+}
 
 /**
  * Compiles the user's `redactPatterns`: a JSON array of strings, or one
@@ -375,8 +478,8 @@ export function compileCustomPatterns(raw: unknown): { patterns: RegExp[]; error
       errors.push(`redactPatterns #${n}: longer than ${MAX_PATTERN_LENGTH} characters, skipped`)
       return
     }
-    if (NESTED_QUANTIFIER.test(source)) {
-      errors.push(`redactPatterns #${n}: nested quantifier or backreference (backtracking risk), skipped`)
+    if (riskyPattern(source)) {
+      errors.push(`redactPatterns #${n}: backtracking risk (backreference, or a repeated group holding a quantifier or alternation), skipped`)
       return
     }
     try {

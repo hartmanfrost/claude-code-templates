@@ -164,7 +164,9 @@ function reportFailure($: Dollar, ctx: Ctx, kind: string, scope: 'subagent' | 'm
   const { count, show } = ctx.notifier.report(`${scope}:${kind}`)
   if (scope === 'subagent') ctx.flags.fallbacks += 1
   if (show) loud($, describeFailure(kind, count, ctx.config, scope))
-  if (scope === 'subagent') $.ui.status(`jev · fallback ×${ctx.flags.fallbacks} (${kind})`)
+  // The status line moves only with a shown notice, so a once-only class
+  // (keyless) does not rewrite it on every spawn.
+  if (show && scope === 'subagent') $.ui.status(`jev · fallback ×${ctx.flags.fallbacks} (${kind})`)
 }
 
 export const register: Register = (on, options) => {

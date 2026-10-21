@@ -555,7 +555,8 @@ export function route(
     wantedRank !== null &&
     currentRank !== null &&
     wantedRank !== currentRank &&
-    (forced || allowed(wantedRank, currentRank, decision.confidence, config))
+    // Risk raises the floor; it never moves the model down.
+    (forced ? wantedRank > currentRank : allowed(wantedRank, currentRank, decision.confidence, config))
       ? wantedModel
       : null
 
@@ -764,7 +765,8 @@ const ESCALATE_AT = new Set([1, 5, 25, 100, 500, 2000])
 
 /**
  * Decides when a failure is shown: the first of each class, then at 5, 25,
- * 100 and so on, so a dead backend is loud at the start and keeps a count
+ * 100 and so on (the once-only classes only the first time, with or without a
+ * `scope:` prefix such as `subagent:no-key`), so a dead backend is loud at the start and keeps a count
  * without a toast on every spawn.
  */
 export function createNotifier(): { report(kind: string): { count: number; show: boolean } } {
@@ -773,7 +775,7 @@ export function createNotifier(): { report(kind: string): { count: number; show:
     report(kind) {
       const count = (counts.get(kind) ?? 0) + 1
       counts.set(kind, count)
-      return { count, show: ONCE_CLASSES.has(kind) ? count === 1 : ESCALATE_AT.has(count) }
+      return { count, show: ONCE_CLASSES.has(kind.slice(kind.lastIndexOf(':') + 1)) ? count === 1 : ESCALATE_AT.has(count) }
     },
   }
 }
@@ -866,8 +868,11 @@ export function createEffortPlans(max = 256): {
       take(promptKey, effort)
     },
     bind(agentId, promptKey, effort) {
+      // An agent that already claimed its entry at turn.start must not take a
+      // second one: that belongs to another spawn with the same prompt.
+      if (byAgent.has(agentId)) return
       take(promptKey, effort)
-      if (!byAgent.has(agentId)) byAgent.set(agentId, effort)
+      byAgent.set(agentId, effort)
       trim()
     },
     claim(agentId, promptKey) {

@@ -608,3 +608,39 @@ test('a typed prompt gets the same treatment as a subagent prompt', () => {
   const { state } = buildPromptState(`token ${ghToken}`, { redact: DEFAULT_REDACT, maxPromptChars: 4000 })
   expect(state.prompt).toBe('token [REDACTED:github-token]')
 })
+
+// --- review fixes ---------------------------------------------------------------
+
+test('a scope-prefixed once-only class is shown exactly once', () => {
+  const notifier = createNotifier()
+  for (const kind of ['subagent:no-key', 'main:no-key']) {
+    expect(notifier.report(kind).show).toBe(true)
+    for (let i = 0; i < 200; i++) expect(notifier.report(kind).show).toBe(false)
+  }
+  // Prefixed escalating classes still escalate.
+  const shown: number[] = []
+  for (let i = 1; i <= 30; i++) if (notifier.report('subagent:timeout').show) shown.push(i)
+  expect(shown).toEqual([1, 5, 25])
+})
+
+test('risk never moves the main-loop model down', () => {
+  const lowDeep: PolicyConfig = { ...config, tiers: { fast: 'haiku', balanced: 'sonnet', deep: 'sonnet' } }
+  const routing = route(decide('fast', 0.9, 0.5, 0.9, 0.95), { model: 'claude-opus-5-5', effort: 'high' }, lowDeep)
+  expect(routing.model).toBeNull()
+  // Up still works.
+  const up = route(decide('fast', 0.9, 0.5, 0.9, 0.95), { model: 'claude-haiku-5-5', effort: 'high' }, lowDeep)
+  expect(up.model).toBe('sonnet')
+})
+
+test('bind does not take the entry of another spawn with the same prompt', () => {
+  const plans = createEffortPlans()
+  const key = hashKey('same prompt')
+  plans.expect(key, 'high')
+  plans.expect(key, 'high')
+  plans.claim('a', key) // A's turn.start
+  plans.bind('a', key, 'high') // A's spawn returns
+  expect(plans.effortOf('a')).toBe('high')
+  plans.claim('b', key) // B's turn.start finds its own entry
+  expect(plans.effortOf('b')).toBe('high')
+  expect(plans.size()).toBe(2)
+})

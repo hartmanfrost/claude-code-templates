@@ -1,0 +1,12 @@
+{
+  "name": "hartmanfrost-mods",
+  "owner": { "name": "hartmanfrost" },
+  "metadata": { "description": "Claude Code mods maintained on this fork" },
+  "plugins": [
+    {
+      "name": "jev-model-router",
+      "source": "./cli-tool/components/mods/productivity/jev-model-router",
+      "description": "Routes the model and effort of each subagent with TypeSafe's Jev; secrets are redacted before anything leaves the machine."
+    }
+  ]
+}
