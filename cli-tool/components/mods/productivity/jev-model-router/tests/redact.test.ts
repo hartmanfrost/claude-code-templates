@@ -5,6 +5,7 @@ import {
   compileCustomPatterns,
   describeCounts,
   entropy,
+  riskyPattern,
   prepareField,
   redact,
   scrubForLog,
@@ -435,4 +436,20 @@ test('custom patterns: alternation inside a repeated group is refused as a backt
   const ok = compileCustomPatterns(['ACME-[0-9]{6}', 'foo(?:bar|baz)', '[a+*]+x', '(abc)?d'])
   expect(ok.patterns.length).toBe(4)
   expect(ok.errors.length).toBe(0)
+})
+
+// --- second review round ------------------------------------------------------------
+
+test('url credentials: host:port with a path and a later @ is not a user and password', () => {
+  expect(out('open http://localhost:3000/a?x=1&email=me@x.com now')).toBe('open http://localhost:3000/a?x=1&email=me@x.com now')
+  expect(out('curl http://host:8080?u=a@b.c')).toBe('curl http://host:8080?u=a@b.c')
+  // A numeric password has no path after it and is still redacted.
+  expect(out('postgres://admin:12345@db/app')).toBe('postgres://[REDACTED:url-credentials]@db/app')
+})
+
+test('riskyPattern: forced alternations and short bounded repeats are allowed, ambiguous ones still refused', () => {
+  for (const ok of ['(a|b){2}', '(?:foo|bar)+', '(a|b)*c', '(?:ab|cd){1,5}']) expect(riskyPattern(ok)).toBe(false)
+  for (const bad of ['(a|aa)+', '(a+)+', '(a*)*', '(.*a){20}', '(\\w+\\s?)+$', '(?:a{1,5})+', '(a|b)+(c|d)+(?:(x|y)z)+', '(a|ab)*', '(a|aa){2,100}', '(a|a)+', '(|a)+']) {
+    expect(riskyPattern(bad)).toBe(true)
+  }
 })

@@ -309,7 +309,11 @@ export function redact(text: string, options: RedactOptions): { text: string; co
   out = sub(out, SLACK_TOKEN, 'slack-token', counts)
   out = sub(out, GOOGLE_KEY, 'google-api-key', counts)
   out = sub(out, JWT, 'jwt', counts)
-  out = sub(out, URL_CREDENTIALS, 'url-credentials', counts, (_m, g) => `${g[0]}${placeholder('url-credentials')}@`)
+  out = sub(out, URL_CREDENTIALS, 'url-credentials', counts, (_m, g) =>
+    // `host:3000/path?x=a@b`: a port and a path, not a user and a password.
+    // A password that is only digits (`user:12345@host`) has no path after it.
+    /^\d{1,5}[/?#]/.test(g[2] ?? '') ? null : `${g[0]}${placeholder('url-credentials')}@`,
+  )
   out = sub(out, URL_TOKEN_USER, 'url-credentials', counts, (m, g) =>
     /\d/.test(g[1] ?? '') ? `${g[0]}${placeholder('url-credentials')}@` : null,
   )
@@ -405,17 +409,44 @@ export function scrubForLog(text: string, max = 200): string {
  * Heuristic guard against catastrophic backtracking: refuses a pattern with a
  * backreference, or with a group that is repeated (`+ * {n,}`) and holds
  * a quantifier, an alternation or another repeated group, at any depth
- * (`(a+)+`, `(?:a|aa)+`, `((a|b))*`). It over-refuses (`(?:foo|bar)+` is
- * safe but refused); user patterns cannot be proven linear, so it errs shut.
+ * (`(a+)+`, `(?:a|aa)+`, `((a|b))*`). An alternation of plain literals with
+ * distinct first characters (`(?:foo|bar)+`, `(a|b)*c`) is allowed, as is an
+ * alternation repeated at most 10 times (`(a|b){2}`). It still over-refuses
+ * (`(?:a{1,5})+` is refused although it is only polynomial in practice);
+ * user patterns cannot be proven linear, so it errs shut.
  */
 export function riskyPattern(source: string): boolean {
   if (/\\[1-9]|\\k</.test(source)) return true
-  // Each stack frame: does this group hold a quantifier or an alternation?
-  const stack: boolean[] = []
+  // quant: holds a quantifier (or a repeated group); alt: holds an alternation;
+  // lit: every alternative is plain literal text starting with a character no
+  // other alternative starts with, so each step of a repeat is forced.
+  interface Frame {
+    quant: boolean
+    alt: boolean
+    lit: boolean
+    starts: Set<string>
+    atStart: boolean
+  }
+  const fresh = (): Frame => ({ quant: false, alt: false, lit: true, starts: new Set(), atStart: true })
+  const stack: Frame[] = []
+  const top = (): Frame | undefined => stack[stack.length - 1]
+  const literal = (f: Frame, ch: string) => {
+    if (f.atStart) {
+      if (f.starts.has(ch)) f.lit = false
+      f.starts.add(ch)
+      f.atStart = false
+    }
+  }
   let inClass = false
   for (let i = 0; i < source.length; i++) {
     const c = source[i] as string
+    const f = top()
     if (c === '\\') {
+      const n = source[i + 1] ?? ''
+      if (f) {
+        if (/[dDwWsSbBnrtfvxuUpPc0-9k]/.test(n)) f.lit = false
+        else literal(f, n)
+      }
       i += 1
       continue
     }
@@ -423,21 +454,63 @@ export function riskyPattern(source: string): boolean {
       if (c === ']') inClass = false
       continue
     }
-    if (c === '[') inClass = true
-    else if (c === '(') stack.push(false)
-    else if (c === '|') {
-      if (stack.length > 0) stack[stack.length - 1] = true
+    if (c === '[') {
+      inClass = true
+      if (f) f.lit = false
+    } else if (c === '(') {
+      const frame = fresh()
+      stack.push(frame)
+      if (source.startsWith('?:', i + 1)) i += 2
+      else if (source[i + 1] === '?') frame.lit = false
+    } else if (c === '|') {
+      if (f) {
+        f.alt = true
+        if (f.atStart) f.lit = false
+        f.atStart = true
+      }
     } else if (c === '+' || c === '*') {
-      if (stack.length > 0) stack[stack.length - 1] = true
-    } else if (c === '{' && /^\{\d+,\d*\}/.test(source.slice(i))) {
-      if (stack.length > 0) stack[stack.length - 1] = true
+      if (f) {
+        f.quant = true
+        f.lit = false
+      }
+    } else if (c === '{' && /^\{\d+(?:,\d*)?\}/.test(source.slice(i))) {
+      if (f) {
+        if (/^\{\d+,\d*\}/.test(source.slice(i))) f.quant = true
+        f.lit = false
+      }
     } else if (c === ')') {
-      const inner = stack.pop() ?? false
-      const after = source[i + 1]
-      const repeated = after === '+' || after === '*' || (after === '{' && /^\{\d+(?:,\d*)?\}/.test(source.slice(i + 1)) && !/^\{1\}/.test(source.slice(i + 1)))
-      if (inner && repeated) return true
-      // What a group holds, or a repeated group itself, counts for its parent.
-      if ((inner || repeated) && stack.length > 0) stack[stack.length - 1] = true
+      const frame = stack.pop()
+      if (!frame) continue
+      if (frame.atStart) frame.lit = false
+      const rest = source.slice(i + 1)
+      let repeated = false
+      let bound = Infinity
+      if (rest.startsWith('+') || rest.startsWith('*')) {
+        repeated = true
+      } else {
+        const m = /^\{(\d+)(?:(,)(\d*))?\}/.exec(rest)
+        if (m && !(m[1] === '1' && m[2] === undefined)) {
+          repeated = true
+          if (m[2] === undefined) bound = Number(m[1])
+          else if (m[3] !== '') bound = Number(m[3])
+        }
+      }
+      if (repeated) {
+        if (frame.quant) return true
+        // Alternation only: safe when forced step by step, or repeated a few times.
+        if (frame.alt && !frame.lit && bound > 10) return true
+      }
+      const parent = top()
+      if (parent) {
+        parent.lit = false
+        parent.atStart = false
+        if (repeated || frame.quant) parent.quant = true
+        if (frame.alt) parent.alt = true
+      }
+    } else if (f && (c === '.' || c === '?' || c === '^' || c === '$')) {
+      f.lit = false
+    } else if (f) {
+      literal(f, c)
     }
   }
   return false

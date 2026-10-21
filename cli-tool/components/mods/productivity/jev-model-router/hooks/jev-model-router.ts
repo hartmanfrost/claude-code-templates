@@ -145,7 +145,7 @@ interface Ctx {
   config: RouterConfig
   warnings: string[]
   notifier: ReturnType<typeof createNotifier>
-  flags: { announced: boolean; fallbacks: number }
+  flags: { announced: boolean; fallbacks: number; status: string }
 }
 
 /** The one-time "I am alive" line, and the one-time list of option problems. */
@@ -164,9 +164,15 @@ function reportFailure($: Dollar, ctx: Ctx, kind: string, scope: 'subagent' | 'm
   const { count, show } = ctx.notifier.report(`${scope}:${kind}`)
   if (scope === 'subagent') ctx.flags.fallbacks += 1
   if (show) loud($, describeFailure(kind, count, ctx.config, scope))
-  // The status line moves only with a shown notice, so a once-only class
-  // (keyless) does not rewrite it on every spawn.
-  if (show && scope === 'subagent') $.ui.status(`jev · fallback ×${ctx.flags.fallbacks} (${kind})`)
+  // The status line follows the real count, not only the shown notices; a
+  // class that never changes (keyless) is written once.
+  if (scope === 'subagent') {
+    const line = kind === 'no-key' ? 'jev · keyless, fallback model' : `jev · fallback ×${ctx.flags.fallbacks} (${kind})`
+    if (line !== ctx.flags.status) {
+      ctx.flags.status = line
+      $.ui.status(line)
+    }
+  }
 }
 
 export const register: Register = (on, options) => {
@@ -183,7 +189,7 @@ export const register: Register = (on, options) => {
   const claimed = new Map<string, Decision | null>()
   const mainPlans = new Map<string, { model?: string; effort?: Effort } | null>()
 
-  const flags = { announced: false, fallbacks: 0 }
+  const flags = { announced: false, fallbacks: 0, status: '' }
 
   const ctx: Ctx = { config, warnings, notifier, flags }
 
@@ -298,13 +304,35 @@ export const register: Register = (on, options) => {
     announce($, ctx)
     if (!config.routeSubagentModel && !config.routeSubagentEffort) return next(e)
 
+    // Files the effort (or its absence) under the prompt before starting the
+    // agent, because its own turn.start may come before `next` returns, and
+    // under its id after. Every spawn that reaches `next` files an entry, so
+    // no agent can take another spawn's.
+    const launch = async (ev: typeof e, effort: Effort | null) => {
+      const promptKey = hashKey(ev.prompt)
+      plans.expect(promptKey, effort)
+      let result
+      try {
+        result = await next(ev)
+      } catch (error) {
+        plans.cancel(promptKey, effort)
+        throw error
+      }
+      if (result.deny !== undefined) {
+        plans.cancel(promptKey, effort)
+        return result
+      }
+      if (result.agentId) plans.bind(result.agentId, promptKey, effort)
+      return result
+    }
+
     // Forks, teammates, resumes and hidden-script workflow agents: no call.
     const skip = skipReason(e, guard)
     if (skip) {
       if (config.logDecisions) {
         $.ui.log(`[jev-model-router] ${e.subagentType}: left alone, ${skip}`, { to: 'debug' })
       }
-      return next(e)
+      return launch(e, null)
     }
 
     // 1. A decision: from the cache, from Jev, from the built-in classifier,
@@ -355,22 +383,9 @@ export const register: Register = (on, options) => {
     const model = config.routeSubagentModel ? routing.model : undefined
     const effort = config.routeSubagentEffort ? routing.effort : undefined
 
-    // 3. Start it, filing the effort under the prompt first (the agent's own
-    //    turn.start may come before `next` returns) and under its id after.
-    const promptKey = hashKey(e.prompt)
-    if (effort) plans.expect(promptKey, effort)
-    let result
-    try {
-      result = await next(model ? { ...e, model } : e)
-    } catch (error) {
-      if (effort) plans.cancel(promptKey, effort)
-      throw error
-    }
-    if (result.deny !== undefined) {
-      if (effort) plans.cancel(promptKey, effort)
-      return result
-    }
-    if (effort && result.agentId) plans.bind(result.agentId, promptKey, effort)
+    // 3. Start it.
+    const result = await launch(model ? { ...e, model } : e, effort ?? null)
+    if (result.deny !== undefined) return result
 
     if (config.logDecisions) {
       const what = [model, effort].filter(Boolean).join('/')

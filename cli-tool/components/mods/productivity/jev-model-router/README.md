@@ -100,7 +100,7 @@ Before anything is sent, every text field is scrubbed and **then** truncated, so
 | `secret-assignment` | `NAME=value`, `NAME: value`, `"name": "value"`, `export NAME=...` where the name ends in key/token/secret/password/passwd/pwd/credential(s) (optionally followed by `_base`/`_value`/`_string`/`_data`/`_content`/`_text`, so `SECRET_KEY_BASE` counts). Short values (4+ characters) and values containing `, ; ) } ]` are covered; `$VAR`, `${X}`, `{{ x }}`, `<x>` references and UI-label prose (`"Enter your password"`) are not, while `"$ecretPass1"`, `"#Abc1234"` and `"correct horse battery staple"` are |
 | `high-entropy-hex`, `high-entropy-base64` | hex of 64+ characters and base64-like runs of 40+ characters with mixed case, digits and high entropy |
 
-Optional, **off by default**, each its own switch: `redactEmails` (`email`), `redactIps` (`ipv4`, `ipv6`), `redactHomePaths` (`/home/<user>`, `/Users/<user>`, `C:\Users\<user>` become `~`). `redactPatterns` adds your own regular expressions, one per line (or a JSON array of strings); matches become `[REDACTED:custom]`. A pattern that is invalid, longer than 200 characters, has a backreference or a repeated group holding a quantifier or an alternation such as `(a+)+` or `(?:a|aa)+` (backtracking risk; this check errs shut, so `(?:foo|bar)+` is refused too) or matches the empty string is skipped and reported once, by position, never by its text.
+Optional, **off by default**, each its own switch: `redactEmails` (`email`), `redactIps` (`ipv4`, `ipv6`), `redactHomePaths` (`/home/<user>`, `/Users/<user>`, `C:\Users\<user>` become `~`). `redactPatterns` adds your own regular expressions, one per line (or a JSON array of strings); matches become `[REDACTED:custom]`. A pattern that is invalid, longer than 200 characters, has a backreference or a repeated group holding a quantifier or an alternation such as `(a+)+` or `(?:a|aa)+` (backtracking risk; this check errs shut: an alternation of plain literals with distinct first characters such as `(?:foo|bar)+`, or one repeated at most 10 times such as `(a|b){2}`, is accepted, but `(?:a{1,5})+` is still refused) or matches the empty string is skipped and reported once, by position, never by its text.
 
 Ordinary code is deliberately left alone: `const token = getToken()`, `password: string`, `max_tokens: 4096`, `tokenizer: "..."`, `sortKey: "name"`, `password: ${PASSWORD}`, git hashes, lockfile hashes, UUIDs and file paths are not redacted.
 
@@ -119,11 +119,18 @@ Linear time: built-in detectors use literal prefixes and bounded, non-overlappin
 - **Toasts** only exist in an interactive terminal; `claude -p` and the SDK get the transcript line and the debug log.
 - **Main-loop routing**, if switched on, is fail-open: on any failure the turn runs unchanged (it has no fallback to apply), and the failure is shown the same way.
 
+## What changed after 0.5.0-hartmanfrost.2
+
+- **Effort cannot cross to another spawn.** Every spawn that reaches `agent.spawn`'s `next` (routed or skipped) files an entry under its prompt, a skipped one as "no effort", so an unrouted agent whose prompt equals a routed spawn's takes its own entry at `turn.start`.
+- **`host:port` URLs are not credentials.** `http://localhost:3000/a?e=me@x.com` is left alone; `user:12345@host` is still redacted.
+- **Status line** follows the real fallback count.
+- **Custom-pattern check** accepts forced literal alternations and short bounded alternation repeats.
+
 ## What changed in 0.5.0-hartmanfrost.2
 
 Fixes from review of `.1`:
 
-- **Keyless / `no-key` notice is once.** The scope-prefixed class (`subagent:no-key`) was escalating at 1, 5, 25 ... ; it is now shown once, and the status line moves only with a shown notice.
+- **Keyless / `no-key` notice is once.** The scope-prefixed class (`subagent:no-key`) was escalating at 1, 5, 25 ... ; it is now shown once, and the status line follows every subagent fallback (`fallback ×N`), written once for keyless.
 - **Risk never lowers the main-loop model** (`routeMainModel`), matching the subagent path and the effort path.
 - **Effort plans:** an agent that already claimed its entry no longer takes a second spawn's entry for the same prompt.
 - **Redaction:** URL passwords with `@` or `/`; an unterminated `BEGIN ... PRIVATE KEY` marker takes the key body, not the prose after it; values that merely start with `options`/`env`/`config`...; short and delimiter-containing passwords; quoted passwords starting with `$ # % @`; `SECRET_KEY_BASE`-style names; short `Basic`/`Bearer` values; prose passphrases; Stripe, npm, GitLab, HuggingFace and Vercel keys; the custom-pattern guard now sees alternation and nesting. Custom patterns remain a heuristic.

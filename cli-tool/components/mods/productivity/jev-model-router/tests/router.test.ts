@@ -644,3 +644,28 @@ test('bind does not take the entry of another spawn with the same prompt', () =>
   expect(plans.effortOf('b')).toBe('high')
   expect(plans.size()).toBe(2)
 })
+
+// --- second review round: a skipped spawn cannot take a routed spawn's effort ------
+
+test('an unrouted agent with the same prompt takes its own entry, not the routed one', () => {
+  const plans = createEffortPlans()
+  const key = hashKey('same prompt')
+  plans.expect(key, null) // skipped spawn, first
+  plans.expect(key, 'high') // routed spawn
+  plans.claim('skipped', key)
+  plans.claim('routed', key)
+  expect(plans.effortOf('skipped')).toBeUndefined()
+  expect(plans.effortOf('routed')).toBe('high')
+})
+
+test('binding removes the matching entry even when the agent id arrives late', () => {
+  const plans = createEffortPlans()
+  const key = hashKey('p')
+  plans.expect(key, null)
+  plans.expect(key, 'low')
+  plans.bind('a', key, null)
+  plans.bind('b', key, 'low')
+  expect(plans.effortOf('a')).toBeUndefined()
+  expect(plans.effortOf('b')).toBe('low')
+  expect(plans.size()).toBe(2)
+})

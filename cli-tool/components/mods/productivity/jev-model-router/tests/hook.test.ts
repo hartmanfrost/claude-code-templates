@@ -216,3 +216,13 @@ test('main-loop routing on with a key: a non-person origin and a bare command ar
   await $.prompt.submit({ text: 'rename the variable foo to bar', wait: false, origin: { kind: 'composer' } } as any)
   expect(w.fetches.length).toBe(1)
 })
+
+test('the status line follows every fallback, not only the shown notices', { options: { typesafeApiKey: KEY } }, async ($, on) => {
+  const w = world(on, () => ({ status: 500, text: 'boom' }))
+  mock.clock(on)
+  for (let i = 0; i < 3; i++) await $.agent.spawn(spawnInput({ prompt: `different task ${i}` }))
+  const lines = w.statuses.filter((s): s is string => typeof s === 'string' && s.includes('fallback'))
+  expect(lines.some((l) => l.includes('×1'))).toBe(true)
+  expect(lines.some((l) => l.includes('×2'))).toBe(true)
+  expect(lines.some((l) => l.includes('×3'))).toBe(true)
+})

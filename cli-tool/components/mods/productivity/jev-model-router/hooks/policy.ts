@@ -826,16 +826,19 @@ export function describeFailure(
  * and under the id too once `next` returns, whichever comes first.
  */
 export function createEffortPlans(max = 256): {
-  expect(promptKey: string, effort: Effort): void
-  cancel(promptKey: string, effort: Effort): void
-  bind(agentId: string, promptKey: string, effort: Effort): void
+  expect(promptKey: string, effort: Effort | null): void
+  cancel(promptKey: string, effort: Effort | null): void
+  bind(agentId: string, promptKey: string, effort: Effort | null): void
   claim(agentId: string, promptKey: string): void
   effortOf(agentId: string): Effort | undefined
   release(agentId: string): void
   size(): number
 } {
-  const byAgent = new Map<string, Effort>()
-  const waiting = new Map<string, Effort[]>()
+  // `null` is a spawn that was NOT given an effort (skipped, unrouted). It is
+  // queued like any other so that such an agent, whose turn.start carries the
+  // same prompt as a routed spawn, takes its own entry and not the routed one.
+  const byAgent = new Map<string, Effort | null>()
+  const waiting = new Map<string, (Effort | null)[]>()
   const trim = () => {
     while (byAgent.size > max) {
       const oldest = byAgent.keys().next().value
@@ -848,14 +851,14 @@ export function createEffortPlans(max = 256): {
       waiting.delete(oldest)
     }
   }
-  const take = (promptKey: string, effort?: Effort): Effort | undefined => {
+  const take = (promptKey: string, effort?: Effort | null): { found: boolean; effort: Effort | null } => {
     const queue = waiting.get(promptKey)
-    if (!queue || queue.length === 0) return undefined
+    if (!queue || queue.length === 0) return { found: false, effort: null }
     const index = effort === undefined ? 0 : queue.indexOf(effort)
-    if (index === -1) return undefined
+    if (index === -1) return { found: false, effort: null }
     const [taken] = queue.splice(index, 1)
     if (queue.length === 0) waiting.delete(promptKey)
-    return taken
+    return { found: true, effort: taken ?? null }
   }
   return {
     expect(promptKey, effort) {
@@ -877,11 +880,11 @@ export function createEffortPlans(max = 256): {
     },
     claim(agentId, promptKey) {
       if (byAgent.has(agentId)) return
-      const effort = take(promptKey)
-      if (effort !== undefined) byAgent.set(agentId, effort)
+      const taken = take(promptKey)
+      if (taken.found) byAgent.set(agentId, taken.effort)
       trim()
     },
-    effortOf: (agentId) => byAgent.get(agentId),
+    effortOf: (agentId) => byAgent.get(agentId) ?? undefined,
     release(agentId) {
       byAgent.delete(agentId)
     },
