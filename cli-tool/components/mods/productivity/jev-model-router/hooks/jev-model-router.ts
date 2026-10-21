@@ -60,6 +60,16 @@ import {
   skipReason,
 } from './policy.ts'
 import type { Decision, Effort, RouterConfig } from './policy.ts'
+import type { Tracker } from './statusfile.ts'
+import {
+  HEARTBEAT_MS,
+  createCoalescer,
+  createTracker,
+  familyOf,
+  safeSessionId,
+  serialize,
+  statePath,
+} from './statusfile.ts'
 import { describeCounts, scrubForLog } from './redact.ts'
 import type { RedactCounts } from './redact.ts'
 
@@ -174,6 +184,78 @@ function reportFailure($: Dollar, ctx: Ctx, kind: string, scope: 'subagent' | 'm
   }
 }
 
+/**
+ * Where this session's status file goes, or null when it cannot be told (no
+ * HOME, an odd session id). Resolved at each write: a /clear changes the id.
+ */
+async function statusTarget($: Dollar): Promise<{ sessionId: string; path: string } | null> {
+  const sessionId = safeSessionId(await $.session.id())
+  if (!sessionId) return null
+  const configured = await $.env.get('CLAUDE_CONFIG_DIR')
+  const home = configured ? undefined : await $.env.get('HOME')
+  const dir = configured || (home ? `${home}/.claude` : '')
+  return dir ? { sessionId, path: statePath(dir, sessionId) } : null
+}
+
+/** The status file's state, shared by the hooks. */
+interface StatusCtx {
+  enabled: boolean
+  tracker: Tracker
+  coalesce: ReturnType<typeof createCoalescer>
+  warned: boolean
+  beating: boolean
+}
+
+/** Writes the current active set; failures are debug-logged once and never thrown. */
+async function writeStatus($: Dollar, sc: StatusCtx): Promise<void> {
+  try {
+    const target = await statusTarget($)
+    if (!target) return
+    await $.fs.write(target.path, serialize(target.sessionId, await $.clock.now(), sc.tracker.active()))
+  } catch (error) {
+    if (!sc.warned) {
+      sc.warned = true
+      $.ui.log(`[jev-model-router] status file not written: ${scrubForLog(String(error))}`, { to: 'debug' })
+    }
+  }
+}
+
+/** Heartbeat: rewrites the file (fresh updatedAt) while anything is active, after pruning. */
+async function heartbeat($: Dollar, sc: StatusCtx): Promise<void> {
+  try {
+    while (sc.tracker.size() > 0) {
+      await $.clock.sleep(HEARTBEAT_MS)
+      let listed: Map<string, string> | undefined
+      try {
+        listed = new Map((await $.agent.list()).map((a) => [a.id, a.status]))
+      } catch {
+        // Not every surface lists agents; the idle prune still applies.
+      }
+      sc.tracker.prune(await $.clock.now(), listed)
+      await sc.coalesce(() => writeStatus($, sc))
+    }
+  } catch {
+    // A rejected sleep (the module unloaded) ends the loop.
+  } finally {
+    sc.beating = false
+  }
+}
+
+/** Writes now if the active set changed, and keeps the heartbeat going while it is not empty. */
+async function publishStatus($: Dollar, sc: StatusCtx, changed: boolean): Promise<void> {
+  if (changed) await sc.coalesce(() => writeStatus($, sc))
+  if (sc.beating || sc.tracker.size() === 0) return
+  sc.beating = true
+  void heartbeat($, sc)
+}
+
+/** Session boundary: nothing carries over (a resumed session reuses its id, its agents are gone). */
+async function clearStatus($: Dollar, sc: StatusCtx): Promise<void> {
+  if (!sc.enabled) return
+  sc.tracker.reset()
+  await sc.coalesce(() => writeStatus($, sc))
+}
+
 export const register: Register = (on, options) => {
   const { config, warnings } = resolveOptions(options)
   const policy = config.policy
@@ -193,11 +275,26 @@ export const register: Register = (on, options) => {
 
   const ctx: Ctx = { config, warnings, notifier, flags }
 
+  // The status file (see statusfile.ts): written when the set of running
+  // routed subagents changes, and every HEARTBEAT_MS while it is not empty.
+  const status: StatusCtx = { enabled: config.statusFile, tracker: createTracker(), coalesce: createCoalescer(), warned: false, beating: false }
+
+  on('session.start', async ($, e, next) => {
+    await clearStatus($, status)
+    return next(e)
+  })
+
+  on('session.end', async ($, e, next) => {
+    await clearStatus($, status)
+    return next(e)
+  })
+
   on('turn.start', async ($, e, next) => {
     if (e.agentId) {
       // The subagent's own turn: its text is the prompt it was spawned with,
       // and its id is what turn.step will carry.
       plans.claim(e.agentId, hashKey(e.text))
+      if (status.enabled) await publishStatus($, status, status.tracker.start(e.agentId, await $.clock.now()))
     } else if (config.routeMainLoop) {
       claimed.set(e.turnId, pending.claim(e.text))
     }
@@ -207,6 +304,7 @@ export const register: Register = (on, options) => {
   on('turn.complete', async ($, e, next) => {
     if (e.agentId) {
       plans.release(e.agentId)
+      if (status.enabled) await publishStatus($, status, status.tracker.complete(e.agentId))
     } else {
       claimed.delete(e.turnId)
       mainPlans.delete(e.turnId)
@@ -262,6 +360,9 @@ export const register: Register = (on, options) => {
   on('turn.step', async function* ($, e, next) {
     // A subagent's step: its effort was decided at agent.spawn.
     if (e.agentId) {
+      if (status.enabled && status.tracker.knows(e.agentId)) {
+        await publishStatus($, status, status.tracker.step(e.agentId, await $.clock.now()))
+      }
       const wanted = plans.effortOf(e.agentId)
       // A model without effort carries none to adjust.
       if (wanted && e.effort !== undefined && e.effort !== wanted) {
@@ -308,7 +409,7 @@ export const register: Register = (on, options) => {
     // agent, because its own turn.start may come before `next` returns, and
     // under its id after. Every spawn that reaches `next` files an entry, so
     // no agent can take another spawn's.
-    const launch = async (ev: typeof e, effort: Effort | null) => {
+    const launch = async (ev: typeof e, effort: Effort | null, routing: { fallback: boolean } | null) => {
       const promptKey = hashKey(ev.prompt)
       const ticket = plans.expect(promptKey, effort, await $.clock.now())
       let result
@@ -324,7 +425,13 @@ export const register: Register = (on, options) => {
         plans.cancel(promptKey, effort, ticket)
         return result
       }
-      plans.bind(result.agentId, promptKey, effort, ticket, await $.clock.now())
+      const boundAt = await $.clock.now()
+      plans.bind(result.agentId, promptKey, effort, ticket, boundAt)
+      // Only agents this router routed are counted in the status file.
+      if (status.enabled && routing) {
+        const meta = { model: familyOf(result.model ?? ev.model ?? ''), effort, fallback: routing.fallback }
+        await publishStatus($, status, status.tracker.bind(result.agentId, meta, boundAt))
+      }
       return result
     }
 
@@ -337,7 +444,7 @@ export const register: Register = (on, options) => {
         unroutable.add(skip.kind)
         $.ui.log(`[jev-model-router] ${skip.reason}: left as it is (no Jev call; further ones of this kind are not logged)`)
       }
-      return launch(e, null)
+      return launch(e, null, null)
     }
 
     // 1. A decision: from the cache, from Jev, from the built-in classifier,
@@ -403,7 +510,7 @@ export const register: Register = (on, options) => {
     const effort = config.routeSubagentEffort ? routing.effort : undefined
 
     // 3. Start it.
-    const result = await launch(model ? { ...e, model } : e, effort ?? null)
+    const result = await launch(model ? { ...e, model } : e, effort ?? null, routing)
     if (result.deny !== undefined) return result
 
     if (config.logDecisions) {

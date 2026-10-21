@@ -336,6 +336,7 @@ export interface RouterConfig {
   routeMainLoop: boolean
   timeoutMs: number
   logDecisions: boolean
+  statusFile: boolean
   maxPromptChars: number
   redactSensitive: boolean
   redact: RedactOptions
@@ -465,6 +466,7 @@ export function resolveOptions(options: RawOptions): { config: RouterConfig; war
     routeMainLoop: routeMainEffort || routeMainModel,
     timeoutMs: ranged('timeoutMs', 1500, 100, 30000),
     logDecisions: flag('logDecisions', true),
+    statusFile: flag('statusFile', true),
     maxPromptChars: ranged('maxPromptChars', 4000, 200, 20000),
     redactSensitive,
     redact: {

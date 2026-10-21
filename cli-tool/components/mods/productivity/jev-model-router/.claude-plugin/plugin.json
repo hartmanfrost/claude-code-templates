@@ -1,6 +1,6 @@
 {
   "name": "jev-model-router",
-  "version": "0.5.0-hartmanfrost.4",
+  "version": "0.5.0-hartmanfrost.5",
   "description": "Picks the model and the reasoning effort of each SUBAGENT (Agent tool and Workflow agent()) with TypeSafe's Jev, a System One decision model reached through TypeSafe's API or the Vercel AI Gateway. The main conversation is not routed unless switched on. Candidates are haiku, sonnet and opus only. When Jev cannot decide, subagents run on a configurable fallback model and effort and the failure is shown. Everything sent out is secret-redacted first.",
   "author": {
     "name": "claude-code-templates",
@@ -206,6 +206,12 @@
       "type": "boolean",
       "title": "Log decisions",
       "description": "Write each routing decision to the transcript. Failures are always shown, whatever this says",
+      "default": true
+    },
+    "statusFile": {
+      "type": "boolean",
+      "title": "Write a status file",
+      "description": "Keep a small JSON file of the routed subagents running right now (model and effort), for an external status line to read: <config dir>/state/jev-model-router/<session id>.json. Local only, no prompt text. Written when the set changes and every 5 s while any is running",
       "default": true
     }
   }

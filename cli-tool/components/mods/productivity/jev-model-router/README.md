@@ -119,6 +119,20 @@ Linear time: built-in detectors use literal prefixes and bounded, non-overlappin
 - **Toasts** only exist in an interactive terminal; `claude -p` and the SDK get the transcript line and the debug log.
 - **Main-loop routing**, if switched on, is fail-open: on any failure the turn runs unchanged (it has no fallback to apply), and the failure is shown the same way.
 
+## What changed in 0.5.0-hartmanfrost.5
+
+- **Status file for an external status line (`statusFile`, default on).** The router keeps `<config dir>/state/jev-model-router/<session id>.json` (`$CLAUDE_CONFIG_DIR`, else `$HOME/.claude`; one file per session, so profiles and concurrent sessions never mix) listing the subagents it routed that are running right now:
+
+  ```json
+  {"v":1,"sessionId":"<uuid>","updatedAt":1792557303476,
+   "active":[{"agentId":"a1b2","model":"haiku","effort":"low","fallback":false,"startedAt":1792557301000}]}
+  ```
+
+  `model` is what the agent actually runs on (the spawn result's, so a forced `CLAUDE_CODE_SUBAGENT_MODEL` shows as it is): `haiku`, `sonnet`, `opus`, or the raw id if unknown. `effort` is `low|medium|high|xhigh`, or `null` when effort is not routed. `fallback` is true when Jev gave no decision and the fallback applied. Times are epoch ms.
+- **What counts.** An agent enters at its `turn.start` (or at the spawn's bind, if its loop started first) and leaves at `turn.complete`, whatever the reason; a resumed agent is active again at its new `turn.start`. Forks, teammates and resumes of agents the router never routed are **not** counted. Agents of several concurrent Workflow runs aggregate in the one file.
+- **Cheap.** Written only when the set changes (a burst of spawns is coalesced into a few writes; `turn.step` only refreshes liveness in memory), plus a heartbeat rewrite every 5 s while anything is active so a reader can tell a live router from a dead one (`updatedAt` older than ~20 s means stale). The heartbeat also drops agents the engine lists as completed/failed/killed, and any agent silent for 20 minutes. `session.start` and `session.end` write `active: []`. No prompt text is ever written. The mod cannot delete files, so old session files stay (a few hundred bytes each); a reader may remove ones older than a week.
+- **Reader contract.** Accept the file only if `v` is 1, `sessionId` equals the session's, and `updatedAt` is fresh; otherwise fall back to the normal rendering. A torn or empty read (the write is not atomic) should be retried next tick. `claude plugin validate` now also lists `$.fs.write`, `$.session.id`, `$.env.get` (`CLAUDE_CONFIG_DIR`, `HOME`) and `$.agent.list`. Set `statusFile: false` to turn it all off.
+
 ## What changed in 0.5.0-hartmanfrost.4
 
 - **Identical prompts are never skipped.** The "same short prompt on three agents of one run" heuristic is gone: a fan-out of N verifiers with one prompt is N real tasks, all routed, and identical concurrent spawns share one Jev call (in-flight dedup plus the decision cache). A hidden-script placeholder is recognised only by its literal text, `(withheld: this workflow run does not share its script)` (Claude Code 2.1.305/2.1.306 spawn site).
@@ -190,6 +204,7 @@ Fixes from review of `.1`:
   redactHomePaths:        boolean (default false)
   redactPatterns:         string  your regexes, one per line or a JSON array
   logDecisions:           boolean log each decision (default true; failures always show)
+  statusFile:             boolean write the running-subagents state file for a status line (default true)
 ```
 
 Declared in `.claude-plugin/plugin.json` (`userConfig`). The two keys are `sensitive`: set them with `/plugin configure` or, non-interactively, `echo '{"typesafeApiKey":"..."}' | claude plugin configure jev-model-router@<marketplace> --values-stdin`; they are stored in secure storage and never written to `settings.json`. Other options go in user settings (`~/.claude/settings.json`, not project settings), `--settings <file>` or managed settings:
@@ -223,6 +238,6 @@ From this fork's marketplace: `/plugin marketplace add hartmanfrost/claude-code-
 claude plugin test cli-tool/components/mods/productivity/jev-model-router
 ```
 
-Pure logic (`tests/policy.test.ts`, `tests/router.test.ts`, `tests/redact.test.ts`: no network, no `$`) plus engine-driven hook tests (`tests/hook.test.ts`), which load the real hooks over stand-ins for the network and the UI: routing off makes no call, the caller's model is overridden, effort is bound by `agentId`, applied at `turn.step` and dropped at `turn.complete`, every failure kind falls back with a toast, keyless gives one notice and never calls the classifier, resumes/forks/teammates/placeholders make no call, and a secret never reaches the request body. Redaction has positive and negative cases per detector, placeholder format, truncation after redaction, custom patterns and an adversarial-input timing check.
+Pure logic (`tests/policy.test.ts`, `tests/router.test.ts`, `tests/redact.test.ts`, and the status-file tracker and serializer in `tests/statusfile.test.ts`: no network, no `$`) plus engine-driven hook tests (`tests/hook.test.ts`), which load the real hooks over stand-ins for the network and the UI: routing off makes no call, the caller's model is overridden, effort is bound by `agentId`, applied at `turn.step` and dropped at `turn.complete`, every failure kind falls back with a toast, keyless gives one notice and never calls the classifier, resumes/forks/teammates/placeholders make no call, and a secret never reaches the request body. The status file has hook tests too (enter at `turn.start`, leave at `turn.complete`, bind after an early `turn.start`, unrouted agents not counted, fallback flag, actual model, config-dir resolution, heartbeat and prune, no write per step, session reset). Redaction has positive and negative cases per detector, placeholder format, truncation after redaction, custom patterns and an adversarial-input timing check.
 
 **Requirements.** Mods are on by default in Claude Code 2.1.287+. A mod runs without `node_modules`, so both backends are spoken to over HTTP through `$.http.fetch`. The TypeSafe wire shape was read from `@typesafe-ai/sdk` v0.6.0; the Gateway's, which is `experimental` in the AI SDK and not documented publicly, from `@ai-sdk/gateway` v4.0.86 and `@ai-sdk/provider` v4.0.17. Either may change.
